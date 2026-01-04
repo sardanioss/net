@@ -169,10 +169,7 @@ Target Akamai hash: `52d84b11737d980aef856699f885ca86`
 | `IndexingNever` | Never index any headers |
 | `IndexingAlways` | Always index headers |
 
-## Related Projects
 
-- [sardanioss/http](https://github.com/sardanioss/http) - HTTP/1.1 fingerprinting (header order, keep-alive patterns)
-- [refraction-networking/utls](https://github.com/refraction-networking/utls) - TLS fingerprinting
 
 ## License
 
