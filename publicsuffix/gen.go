@@ -33,7 +33,7 @@ import (
 	"slices"
 	"strings"
 
-	"golang.org/x/net/idna"
+	"github.com/sardanioss/net/idna"
 )
 
 const (

@@ -15,8 +15,8 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/net/http/httpguts"
-	"golang.org/x/net/http2/hpack"
+	"github.com/sardanioss/net/http/httpguts"
+	"github.com/sardanioss/net/http2/hpack"
 )
 
 var (
@@ -49,6 +49,15 @@ type EncodeHeadersParam struct {
 	// DefaultUserAgent is the User-Agent header to send when the request
 	// neither contains a User-Agent nor disables it.
 	DefaultUserAgent string
+
+	// PseudoHeaderOrder specifies the order of HTTP/2 pseudo-headers.
+	// Default order is [":method", ":authority", ":scheme", ":path"] (Chrome order).
+	// If nil, uses Chrome order. Firefox uses [":method", ":path", ":authority", ":scheme"].
+	PseudoHeaderOrder []string
+
+	// HeaderOrder specifies the order in which regular headers should be sent.
+	// If nil, headers are sent in sorted order.
+	HeaderOrder []string
 }
 
 // EncodeHeadersResult is the result of EncodeHeaders.
@@ -135,29 +144,59 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		// target URI (the path-absolute production and optionally a '?' character
 		// followed by the query production, see Sections 3.3 and 3.4 of
 		// [RFC3986]).
-		f(":authority", host)
 		m := req.Method
 		if m == "" {
 			m = "GET"
 		}
-		f(":method", m)
+
+		// Build pseudo-header values map
+		pseudoHeaders := map[string]string{
+			":method":    m,
+			":authority": host,
+		}
 		if !isNormalConnect {
-			f(":path", path)
-			f(":scheme", req.URL.Scheme)
+			pseudoHeaders[":path"] = path
+			pseudoHeaders[":scheme"] = req.URL.Scheme
 		}
 		if protocol != "" {
-			f(":protocol", protocol)
+			pseudoHeaders[":protocol"] = protocol
+		}
+
+		// Send pseudo-headers in specified order (default: Chrome order)
+		pseudoOrder := param.PseudoHeaderOrder
+		if len(pseudoOrder) == 0 {
+			// Default to Chrome order: :method, :authority, :scheme, :path
+			if isNormalConnect {
+				pseudoOrder = []string{":method", ":authority"}
+			} else {
+				pseudoOrder = []string{":method", ":authority", ":scheme", ":path"}
+			}
+			if protocol != "" {
+				pseudoOrder = append(pseudoOrder, ":protocol")
+			}
+		}
+
+		for _, name := range pseudoOrder {
+			if val, ok := pseudoHeaders[name]; ok {
+				f(name, val)
+			}
 		}
 		if trailers != "" {
 			f("trailer", trailers)
 		}
 
 		var didUA bool
-		for k, vv := range req.Header {
+
+		// Helper to process a single header
+		processHeader := func(k string, vv []string) {
+			// Skip magic ordering keys - they are only for controlling order
+			if k == "Header-Order:" || k == "PHeader-Order:" {
+				return
+			}
 			if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
 				// Host is :authority, already sent.
 				// Content-Length is automatic, set below.
-				continue
+				return
 			} else if asciiEqualFold(k, "connection") ||
 				asciiEqualFold(k, "proxy-connection") ||
 				asciiEqualFold(k, "transfer-encoding") ||
@@ -167,7 +206,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 				// Fields, don't send connection-specific
 				// fields. We have already checked if any
 				// are error-worthy so just ignore the rest.
-				continue
+				return
 			} else if asciiEqualFold(k, "user-agent") {
 				// Match Go's http1 behavior: at most one
 				// User-Agent. If set to nil or empty string,
@@ -175,11 +214,11 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 				// include the default (below).
 				didUA = true
 				if len(vv) < 1 {
-					continue
+					return
 				}
 				vv = vv[:1]
 				if vv[0] == "" {
-					continue
+					return
 				}
 			} else if asciiEqualFold(k, "cookie") {
 				// Per 8.1.2.5 To allow for better compression efficiency, the
@@ -203,14 +242,46 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 						f("cookie", v)
 					}
 				}
-				continue
+				return
 			} else if k == ":protocol" {
 				// :protocol pseudo-header was already sent above.
-				continue
+				return
 			}
 
 			for _, v := range vv {
 				f(k, v)
+			}
+		}
+
+		// Process headers in specified order if HeaderOrder is provided
+		if len(param.HeaderOrder) > 0 {
+			// First, process headers in the specified order
+			processedHeaders := make(map[string]bool)
+			for _, k := range param.HeaderOrder {
+				// Find the header (case-insensitive match)
+				for hk, vv := range req.Header {
+					if asciiEqualFold(hk, k) && !processedHeaders[hk] {
+						processHeader(hk, vv)
+						processedHeaders[hk] = true
+						break
+					}
+				}
+			}
+			// Then process any remaining headers not in the order list
+			for k, vv := range req.Header {
+				if !processedHeaders[k] {
+					processHeader(k, vv)
+				}
+			}
+		} else {
+			// No order specified, use sorted order for consistency
+			keys := make([]string, 0, len(req.Header))
+			for k := range req.Header {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				processHeader(k, req.Header[k])
 			}
 		}
 		if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
@@ -344,6 +415,10 @@ func validPseudoPath(v string) bool {
 
 func validateHeaders(hdrs map[string][]string) string {
 	for k, vv := range hdrs {
+		// Skip magic ordering keys - they are not sent over the wire
+		if k == "Header-Order:" || k == "PHeader-Order:" {
+			continue
+		}
 		if !httpguts.ValidHeaderFieldName(k) && k != ":protocol" {
 			return fmt.Sprintf("name %q", k)
 		}

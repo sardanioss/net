@@ -260,7 +260,7 @@ var publicSuffixTestCases = []struct {
 	// "platform.sh" and "sh", there are valid arguments for either behavior,
 	// and different browsers have implemented different behaviors.
 	//
-	// This implementation, Go's golang.org/x/net/publicsuffix, returns "sh",
+	// This implementation, Go's github.com/sardanioss/net/publicsuffix, returns "sh",
 	// the same as a literal interpretation of the "Formal Algorithm" section
 	// of https://publicsuffix.org/list/
 	//

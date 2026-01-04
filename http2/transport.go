@@ -32,16 +32,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/http/httpguts"
-	"golang.org/x/net/http2/hpack"
-	"golang.org/x/net/idna"
-	"golang.org/x/net/internal/httpcommon"
+	"github.com/sardanioss/net/http/httpguts"
+	"github.com/sardanioss/net/http2/hpack"
+	"github.com/sardanioss/net/idna"
+	"github.com/sardanioss/net/internal/httpcommon"
 )
 
 const (
 	// transportDefaultConnFlow is how many connection-level flow control
 	// tokens we give the server at start-up, past the default 64k.
-	transportDefaultConnFlow = 1 << 30
+	// Chrome uses 15663105, which is the default for browser fingerprinting.
+	transportDefaultConnFlow = 15663105
 
 	// transportDefaultStreamFlow is how many stream-level flow
 	// control tokens we announce to the peer, and how many bytes
@@ -58,6 +59,21 @@ const (
 	// defaultMaxConcurrentStreams is a connections default maxConcurrentStreams
 	// if the server doesn't include one in its initial SETTINGS frame.
 	defaultMaxConcurrentStreams = 1000
+)
+
+// Magic header keys for per-request header ordering (compatible with bogdanfinn/fhttp)
+const (
+	// HeaderOrderKey is a magic key for Request.Header that, if present,
+	// defines the order in which regular headers should be sent.
+	// The value is a slice of lowercase header names.
+	// Example: req.Header[HeaderOrderKey] = []string{"accept", "user-agent", "accept-language"}
+	HeaderOrderKey = "Header-Order:"
+
+	// PHeaderOrderKey is a magic key for Request.Header that, if present,
+	// defines the order of HTTP/2 pseudo-headers.
+	// Valid values are :method, :authority, :scheme, :path
+	// Example: req.Header[PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+	PHeaderOrderKey = "PHeader-Order:"
 )
 
 // Transport is an HTTP/2 Transport.
@@ -105,6 +121,65 @@ type Transport struct {
 	// AllowHTTP, if true, permits HTTP/2 requests using the insecure,
 	// plain-text "http" scheme. Note that this does not enable h2c support.
 	AllowHTTP bool
+
+	// === HTTP/2 Fingerprinting Fields ===
+
+	// ConnectionFlow is the WINDOW_UPDATE increment sent after the connection preface.
+	// If zero, uses transportDefaultConnFlow (Chrome uses 15663105).
+	ConnectionFlow uint32
+
+	// Settings contains custom HTTP/2 SETTINGS values to send.
+	// Keys are SettingID values (e.g., SettingHeaderTableSize).
+	// If nil, default settings are used.
+	Settings map[SettingID]uint32
+
+	// SettingsOrder specifies the order in which SETTINGS should be sent.
+	// This is important for fingerprinting as different browsers send settings
+	// in different orders. If nil, settings are sent in map iteration order.
+	SettingsOrder []SettingID
+
+	// PseudoHeaderOrder specifies the order of HTTP/2 pseudo-headers.
+	// Default is [":method", ":authority", ":scheme", ":path"] (Chrome order).
+	// Firefox uses [":method", ":path", ":authority", ":scheme"].
+	PseudoHeaderOrder []string
+
+	// Priorities contains PRIORITY frames to send after the connection preface.
+	// Chrome sends priority information in the HEADERS frame instead.
+	Priorities []Priority
+
+	// HeaderPriority specifies the priority to include in HEADERS frames.
+	// If non-nil, the PRIORITY flag is set on HEADERS frames.
+	HeaderPriority *PriorityParam
+
+	// HeaderOrder specifies the order in which regular headers should be sent.
+	// If nil, headers are sent in the order they appear in the request.
+	HeaderOrder []string
+
+	// UserAgent specifies the default User-Agent header to send when the request
+	// doesn't contain one. If empty, uses "Go-http-client/2.0".
+	// Set this to match the browser profile being fingerprinted.
+	UserAgent string
+
+	// StreamPriorityMode controls how stream priorities are assigned.
+	// Chrome uses exclusive dependencies on stream 0 with weight 256.
+	StreamPriorityMode StreamPriorityMode
+
+	// StreamPriorityFunc is a custom function to calculate priority for each stream.
+	// If set, this takes precedence over StreamPriorityMode.
+	// The function receives the stream ID and returns the priority parameters.
+	StreamPriorityFunc func(streamID uint32) PriorityParam
+
+	// HPACKIndexingPolicy controls how the HPACK encoder indexes headers.
+	// Use hpack.IndexingChrome for Chrome-like behavior.
+	HPACKIndexingPolicy hpack.IndexingPolicy
+
+	// HPACKNeverIndex is a list of header names that should never be indexed.
+	HPACKNeverIndex []string
+
+	// HPACKAlwaysIndex is a list of header names that should always be indexed.
+	HPACKAlwaysIndex []string
+
+	// === End Fingerprinting Fields ===
 
 	// MaxHeaderListSize is the http2 SETTINGS_MAX_HEADER_LIST_SIZE to
 	// send in the initial settings frame. It is how many bytes
@@ -186,6 +261,66 @@ type Transport struct {
 	connPoolOrDef ClientConnPool // non-nil version of ConnPool
 
 	*transportTestHooks
+}
+
+// Priority represents an HTTP/2 PRIORITY frame to be sent.
+type Priority struct {
+	StreamID      uint32
+	PriorityParam PriorityParam
+}
+
+// StreamPriorityMode controls how stream priorities are calculated.
+type StreamPriorityMode int
+
+const (
+	// StreamPriorityDefault uses Go's default behavior (no priority in HEADERS).
+	StreamPriorityDefault StreamPriorityMode = iota
+
+	// StreamPriorityChrome emulates Chrome's priority behavior:
+	// - All streams are exclusive children of stream 0
+	// - Weight is 256 (255 in 0-indexed representation)
+	// - Priority is included in HEADERS frame
+	StreamPriorityChrome
+
+	// StreamPriorityFirefox emulates Firefox's priority behavior:
+	// - Uses a dependency tree based on resource type
+	// - Different weights for different resources
+	StreamPriorityFirefox
+
+	// StreamPriorityCustom uses StreamPriorityFunc for custom logic.
+	StreamPriorityCustom
+)
+
+// GetStreamPriority returns the priority parameters for a stream based on the mode.
+func (t *Transport) GetStreamPriority(streamID uint32) *PriorityParam {
+	// Custom function takes precedence
+	if t.StreamPriorityFunc != nil {
+		p := t.StreamPriorityFunc(streamID)
+		return &p
+	}
+
+	switch t.StreamPriorityMode {
+	case StreamPriorityChrome:
+		return &PriorityParam{
+			StreamDep: 0,
+			Exclusive: true,
+			Weight:    255, // Chrome uses 256 (255 is 0-indexed)
+		}
+	case StreamPriorityFirefox:
+		// Firefox uses a more complex priority tree
+		// For simplicity, use a basic Firefox-like behavior
+		return &PriorityParam{
+			StreamDep: 0,
+			Exclusive: false,
+			Weight:    41, // Firefox default weight
+		}
+	case StreamPriorityCustom:
+		// Custom mode requires StreamPriorityFunc
+		return nil
+	default:
+		// StreamPriorityDefault - no priority in HEADERS
+		return nil
+	}
 }
 
 // Hook points used for testing.
@@ -849,21 +984,51 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		cc.tlsState = &state
 	}
 
-	initialSettings := []Setting{
-		{ID: SettingEnablePush, Val: 0},
-		{ID: SettingInitialWindowSize, Val: uint32(cc.initialStreamRecvWindowSize)},
-	}
-	initialSettings = append(initialSettings, Setting{ID: SettingMaxFrameSize, Val: conf.MaxReadFrameSize})
-	if max := t.maxHeaderListSize(); max != 0 {
-		initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: max})
-	}
-	if maxHeaderTableSize != initialHeaderTableSize {
-		initialSettings = append(initialSettings, Setting{ID: SettingHeaderTableSize, Val: maxHeaderTableSize})
+	// Build initial SETTINGS frame
+	var initialSettings []Setting
+
+	if t.Settings != nil && len(t.SettingsOrder) > 0 {
+		// Use custom settings in specified order (for fingerprinting)
+		for _, settingID := range t.SettingsOrder {
+			if val, ok := t.Settings[settingID]; ok {
+				initialSettings = append(initialSettings, Setting{ID: settingID, Val: val})
+			}
+		}
+	} else if t.Settings != nil {
+		// Custom settings but no order specified - use map (random order)
+		for id, val := range t.Settings {
+			initialSettings = append(initialSettings, Setting{ID: id, Val: val})
+		}
+	} else {
+		// Default settings (original behavior)
+		initialSettings = []Setting{
+			{ID: SettingEnablePush, Val: 0},
+			{ID: SettingInitialWindowSize, Val: uint32(cc.initialStreamRecvWindowSize)},
+		}
+		initialSettings = append(initialSettings, Setting{ID: SettingMaxFrameSize, Val: conf.MaxReadFrameSize})
+		if max := t.maxHeaderListSize(); max != 0 {
+			initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: max})
+		}
+		if maxHeaderTableSize != initialHeaderTableSize {
+			initialSettings = append(initialSettings, Setting{ID: SettingHeaderTableSize, Val: maxHeaderTableSize})
+		}
 	}
 
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(initialSettings...)
-	cc.fr.WriteWindowUpdate(0, uint32(conf.MaxUploadBufferPerConnection))
+
+	// Send WINDOW_UPDATE with custom or default connection flow
+	connFlow := t.ConnectionFlow
+	if connFlow == 0 {
+		connFlow = uint32(conf.MaxUploadBufferPerConnection)
+	}
+	cc.fr.WriteWindowUpdate(0, connFlow)
+
+	// Send PRIORITY frames if configured (for fingerprinting)
+	for _, priority := range t.Priorities {
+		cc.fr.WritePriority(priority.StreamID, priority.PriorityParam)
+	}
+
 	cc.inflow.init(conf.MaxUploadBufferPerConnection + initialWindowSize)
 	cc.bw.Flush()
 	if cc.werr != nil {
@@ -1605,7 +1770,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
 	cc.hbuf.Reset()
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, func(name, value string) {
+	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, func(name, value string) {
 		cc.writeHeader(name, value)
 	})
 	if err != nil {
@@ -1621,7 +1786,25 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	return err
 }
 
-func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+	// Check for per-request magic keys (compatible with bogdanfinn/fhttp)
+	// These override transport-level settings
+	effectivePseudoOrder := pseudoHeaderOrder
+	effectiveHeaderOrder := headerOrder
+
+	if pOrder, ok := req.Header[PHeaderOrderKey]; ok && len(pOrder) > 0 {
+		effectivePseudoOrder = pOrder
+	}
+	if hOrder, ok := req.Header[HeaderOrderKey]; ok && len(hOrder) > 0 {
+		effectiveHeaderOrder = hOrder
+	}
+
+	// Use custom user agent if provided, otherwise use default
+	effectiveUserAgent := defaultUserAgent
+	if userAgent != "" {
+		effectiveUserAgent = userAgent
+	}
+
 	return httpcommon.EncodeHeaders(req.Context(), httpcommon.EncodeHeadersParam{
 		Request: httpcommon.Request{
 			Header:              req.Header,
@@ -1633,7 +1816,9 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 		},
 		AddGzipHeader:         addGzipHeader,
 		PeerMaxHeaderListSize: peerMaxHeaderListSize,
-		DefaultUserAgent:      defaultUserAgent,
+		DefaultUserAgent:      effectiveUserAgent,
+		PseudoHeaderOrder:     effectivePseudoOrder,
+		HeaderOrder:           effectiveHeaderOrder,
 	}, headerf)
 }
 
@@ -1784,12 +1969,18 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
-			cc.fr.WriteHeaders(HeadersFrameParam{
+			param := HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
-			})
+			}
+			// Add priority information if configured (for fingerprinting)
+			// Chrome includes priority in HEADERS frame with weight=256, exclusive=1, depends_on=0
+			if cc.t.HeaderPriority != nil {
+				param.Priority = *cc.t.HeaderPriority
+			}
+			cc.fr.WriteHeaders(param)
 			first = false
 		} else {
 			cc.fr.WriteContinuation(streamID, endHeaders, chunk)

@@ -7,7 +7,7 @@ package quic
 import (
 	"crypto/tls"
 
-	"golang.org/x/net/internal/testcert"
+	"github.com/sardanioss/net/internal/testcert"
 )
 
 func newTestTLSConfig(side connSide) *tls.Config {

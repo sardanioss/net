@@ -22,8 +22,8 @@ import (
 	"testing/synctest"
 	"time"
 
-	"golang.org/x/net/http2/hpack"
-	"golang.org/x/net/internal/gate"
+	"github.com/sardanioss/net/http2/hpack"
+	"github.com/sardanioss/net/internal/gate"
 )
 
 // TestTestClientConn demonstrates usage of testClientConn.

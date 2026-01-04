@@ -7,8 +7,8 @@ package icmp
 import (
 	"encoding/binary"
 
-	"golang.org/x/net/internal/iana"
-	"golang.org/x/net/ipv4"
+	"github.com/sardanioss/net/internal/iana"
+	"github.com/sardanioss/net/ipv4"
 )
 
 // A ParamProb represents an ICMP parameter problem message body.

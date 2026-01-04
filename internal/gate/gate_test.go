@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/internal/gate"
+	"github.com/sardanioss/net/internal/gate"
 )
 
 func TestGateLockAndUnlock(t *testing.T) {

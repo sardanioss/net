@@ -12,7 +12,7 @@
 // ICMP extensions for interface and next-hop identification are
 // defined in RFC 5837.
 // PROBE: A utility for probing interfaces is defined in RFC 8335.
-package icmp // import "golang.org/x/net/icmp"
+package icmp // import "github.com/sardanioss/net/icmp"
 
 import (
 	"encoding/binary"
@@ -20,9 +20,9 @@ import (
 	"net"
 	"runtime"
 
-	"golang.org/x/net/internal/iana"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
+	"github.com/sardanioss/net/internal/iana"
+	"github.com/sardanioss/net/ipv4"
+	"github.com/sardanioss/net/ipv6"
 )
 
 // BUG(mikio): This package is not implemented on JS, NaCl and Plan 9.

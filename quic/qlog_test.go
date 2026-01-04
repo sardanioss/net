@@ -19,7 +19,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"golang.org/x/net/quic/qlog"
+	"github.com/sardanioss/net/quic/qlog"
 )
 
 func TestQLogHandshake(t *testing.T) {

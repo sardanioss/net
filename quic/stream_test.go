@@ -17,7 +17,7 @@ import (
 	"testing"
 	"testing/synctest"
 
-	"golang.org/x/net/internal/quic/quicwire"
+	"github.com/sardanioss/net/internal/quic/quicwire"
 )
 
 func TestStreamWriteBlockedByOutputBuffer(t *testing.T) {

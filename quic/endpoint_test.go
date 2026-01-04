@@ -18,7 +18,7 @@ import (
 	"testing"
 	"testing/synctest"
 
-	"golang.org/x/net/quic/qlog"
+	"github.com/sardanioss/net/quic/qlog"
 )
 
 func TestConnect(t *testing.T) {

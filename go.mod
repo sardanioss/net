@@ -1,4 +1,4 @@
-module golang.org/x/net
+module github.com/sardanioss/net
 
 go 1.24.0
 

@@ -7,7 +7,7 @@
 package http3
 
 import (
-	"golang.org/x/net/internal/quic/quicwire"
+	"github.com/sardanioss/net/internal/quic/quicwire"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"golang.org/x/net/idna"
+	"github.com/sardanioss/net/idna"
 )
 
 var isTokenTable = [256]bool{

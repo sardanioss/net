@@ -19,8 +19,8 @@ import (
 	"testing"
 	"testing/synctest"
 
-	"golang.org/x/net/internal/quic/quicwire"
-	"golang.org/x/net/quic"
+	"github.com/sardanioss/net/internal/quic/quicwire"
+	"github.com/sardanioss/net/quic"
 )
 
 func TestTransportServerCreatesBidirectionalStream(t *testing.T) {

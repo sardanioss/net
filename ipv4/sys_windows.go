@@ -5,8 +5,8 @@
 package ipv4
 
 import (
-	"golang.org/x/net/internal/iana"
-	"golang.org/x/net/internal/socket"
+	"github.com/sardanioss/net/internal/iana"
+	"github.com/sardanioss/net/internal/socket"
 
 	"golang.org/x/sys/windows"
 )

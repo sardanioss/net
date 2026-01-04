@@ -11,7 +11,7 @@
 // requires Go 1.6 or later)
 //
 // See https://http2.github.io/ for more information on HTTP/2.
-package http2 // import "golang.org/x/net/http2"
+package http2 // import "github.com/sardanioss/net/http2"
 
 import (
 	"bufio"
@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/http/httpguts"
+	"github.com/sardanioss/net/http/httpguts"
 )
 
 var (

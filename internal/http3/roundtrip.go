@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"sync"
 
-	"golang.org/x/net/internal/httpcommon"
+	"github.com/sardanioss/net/internal/httpcommon"
 )
 
 type roundTripState struct {

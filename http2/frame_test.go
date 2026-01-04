@@ -15,7 +15,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"golang.org/x/net/http2/hpack"
+	"github.com/sardanioss/net/http2/hpack"
 )
 
 func testFramer() (*Framer, *bytes.Buffer) {

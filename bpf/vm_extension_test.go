@@ -7,7 +7,7 @@ package bpf_test
 import (
 	"testing"
 
-	"golang.org/x/net/bpf"
+	"github.com/sardanioss/net/bpf"
 )
 
 func TestVMLoadExtensionNotImplemented(t *testing.T) {

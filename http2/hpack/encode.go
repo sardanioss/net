@@ -13,6 +13,24 @@ const (
 	initialHeaderTableSize = 4096
 )
 
+// IndexingPolicy controls how the HPACK encoder decides whether to index headers.
+type IndexingPolicy int
+
+const (
+	// IndexingDefault uses the default Go behavior (index if fits in table)
+	IndexingDefault IndexingPolicy = iota
+	// IndexingChrome emulates Chrome's indexing behavior
+	IndexingChrome
+	// IndexingNever never indexes any headers (always use literal)
+	IndexingNever
+	// IndexingAlways always indexes headers (if they fit)
+	IndexingAlways
+)
+
+// IndexingFunc is a custom function to decide whether to index a header.
+// Return true to index, false to not index.
+type IndexingFunc func(f HeaderField) bool
+
 type Encoder struct {
 	dynTab dynamicTable
 	// minSize is the minimum table size set by
@@ -28,6 +46,23 @@ type Encoder struct {
 	tableSizeUpdate bool
 	w               io.Writer
 	buf             []byte
+
+	// === Fingerprinting Fields ===
+
+	// IndexPolicy controls the indexing behavior for fingerprinting.
+	// Default is IndexingDefault which uses standard Go behavior.
+	IndexPolicy IndexingPolicy
+
+	// CustomIndexingFunc allows custom logic for deciding whether to index.
+	// If set, this takes precedence over IndexPolicy.
+	CustomIndexingFunc IndexingFunc
+
+	// NeverIndexHeaders is a set of header names that should never be indexed.
+	// This is useful for fingerprinting as Chrome never indexes certain headers.
+	NeverIndexHeaders map[string]bool
+
+	// AlwaysIndexHeaders is a set of header names that should always be indexed.
+	AlwaysIndexHeaders map[string]bool
 }
 
 // NewEncoder returns a new Encoder which performs HPACK encoding. An
@@ -138,7 +173,116 @@ func (e *Encoder) SetMaxDynamicTableSizeLimit(v uint32) {
 
 // shouldIndex reports whether f should be indexed.
 func (e *Encoder) shouldIndex(f HeaderField) bool {
-	return !f.Sensitive && f.Size() <= e.dynTab.maxSize
+	// Never index sensitive headers
+	if f.Sensitive {
+		return false
+	}
+
+	// Check if header fits in table
+	if f.Size() > e.dynTab.maxSize {
+		return false
+	}
+
+	// Custom indexing function takes precedence
+	if e.CustomIndexingFunc != nil {
+		return e.CustomIndexingFunc(f)
+	}
+
+	// Check never/always index lists
+	if e.NeverIndexHeaders != nil && e.NeverIndexHeaders[f.Name] {
+		return false
+	}
+	if e.AlwaysIndexHeaders != nil && e.AlwaysIndexHeaders[f.Name] {
+		return true
+	}
+
+	// Apply indexing policy
+	switch e.IndexPolicy {
+	case IndexingNever:
+		return false
+	case IndexingAlways:
+		return true
+	case IndexingChrome:
+		return e.chromeIndexingBehavior(f)
+	default:
+		// IndexingDefault - original behavior
+		return true
+	}
+}
+
+// chromeIndexingBehavior emulates Chrome's HPACK indexing decisions.
+// Chrome has specific patterns for which headers it indexes to avoid
+// dynamic table pollution and match browser fingerprint.
+func (e *Encoder) chromeIndexingBehavior(f HeaderField) bool {
+	name := f.Name
+
+	// Pseudo-headers - Chrome uses static table references, doesn't index
+	if len(name) > 0 && name[0] == ':' {
+		return false
+	}
+
+	// Headers Chrome typically doesn't index (values change frequently)
+	switch name {
+	case "cookie", "set-cookie":
+		return false
+	case "date", "last-modified", "expires":
+		return false
+	case "etag", "if-none-match", "if-modified-since":
+		return false
+	case "content-length", "content-range":
+		return false
+	case "age", "x-request-id", "x-correlation-id":
+		return false
+	case "authorization", "proxy-authorization":
+		return false
+	}
+
+	// Headers Chrome typically indexes (values are stable)
+	switch name {
+	case "accept", "accept-encoding", "accept-language":
+		return true
+	case "user-agent":
+		return true
+	case "cache-control", "pragma":
+		return true
+	case "content-type":
+		return true
+	case "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform":
+		return true
+	case "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user":
+		return true
+	case "upgrade-insecure-requests":
+		return true
+	}
+
+	// Default: index if value is reasonably short (Chrome heuristic)
+	return len(f.Value) < 128
+}
+
+// SetIndexingPolicy sets the indexing policy for this encoder.
+func (e *Encoder) SetIndexingPolicy(policy IndexingPolicy) {
+	e.IndexPolicy = policy
+}
+
+// SetCustomIndexingFunc sets a custom function for indexing decisions.
+func (e *Encoder) SetCustomIndexingFunc(fn IndexingFunc) {
+	e.CustomIndexingFunc = fn
+}
+
+// SetNeverIndexHeaders sets headers that should never be indexed.
+func (e *Encoder) SetNeverIndexHeaders(headers []string) {
+	e.NeverIndexHeaders = make(map[string]bool)
+	for _, h := range headers {
+		e.NeverIndexHeaders[h] = true
+	}
+}
+
+// SetAlwaysIndexHeaders sets headers that should always be indexed.
+func (e *Encoder) SetAlwaysIndexHeaders(headers []string) {
+	e.AlwaysIndexHeaders = make(map[string]bool)
+	for _, h := range headers {
+		e.AlwaysIndexHeaders[h] = true
+	}
 }
 
 // appendIndexed appends index i, as encoded in "Indexed Header Field"
