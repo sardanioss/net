@@ -12,7 +12,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"flag"
 	"fmt"

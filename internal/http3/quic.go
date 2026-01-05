@@ -7,7 +7,7 @@
 package http3
 
 import (
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 
 	"github.com/sardanioss/net/quic"
 )

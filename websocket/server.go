@@ -8,7 +8,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 )
 
 func newServerConn(rwc io.ReadWriteCloser, buf *bufio.ReadWriter, req *http.Request, config *Config, handshake func(*Config, *http.Request) error) (conn *Conn, err error) {

@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http/httptrace"
+	"github.com/sardanioss/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"sort"

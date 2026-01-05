@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"reflect"
 	"strconv"
 	"testing"

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"reflect"
 	"slices"
 	"testing"

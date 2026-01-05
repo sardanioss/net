@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"path"
 	"path/filepath"

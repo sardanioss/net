@@ -9,7 +9,7 @@ package http2
 import (
 	"bytes"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"reflect"
 	"slices"

@@ -15,11 +15,11 @@ package http2 // import "github.com/sardanioss/net/http2"
 
 import (
 	"bufio"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"sort"
 	"strconv"

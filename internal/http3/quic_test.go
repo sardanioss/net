@@ -9,7 +9,7 @@ package http3
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"net"
 	"net/netip"
 	"runtime"

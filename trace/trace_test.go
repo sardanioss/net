@@ -5,7 +5,7 @@
 package trace
 
 import (
-	"net/http"
+	http "github.com/sardanioss/http"
 	"reflect"
 	"testing"
 )

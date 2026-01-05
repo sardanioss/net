@@ -9,7 +9,7 @@ package http3
 import (
 	"errors"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"strconv"
 	"sync"
 

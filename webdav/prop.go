@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"path/filepath"
 	"strconv"

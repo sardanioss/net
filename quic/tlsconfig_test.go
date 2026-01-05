@@ -5,7 +5,7 @@
 package quic
 
 import (
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 
 	"github.com/sardanioss/net/internal/testcert"
 )

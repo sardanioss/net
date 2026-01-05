@@ -8,7 +8,7 @@ package http3
 
 import (
 	"context"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"sync"
 
 	"github.com/sardanioss/net/quic"

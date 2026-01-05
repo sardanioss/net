@@ -7,7 +7,7 @@
 package http2
 
 import (
-	"net/http"
+	http "github.com/sardanioss/http"
 	"testing"
 	"time"
 )

@@ -10,7 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"runtime"
 	"sort"
 	"strconv"

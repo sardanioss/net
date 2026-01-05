@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"net/netip"
 	"testing"

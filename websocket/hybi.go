@@ -16,7 +16,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/url"
 	"strings"
 )

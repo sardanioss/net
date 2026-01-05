@@ -6,12 +6,12 @@ package h2c
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/http/httptest"
 	"strings"
 	"testing"

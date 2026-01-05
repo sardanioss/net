@@ -6,7 +6,7 @@ package quic
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"fmt"
 	"net"

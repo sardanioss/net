@@ -24,14 +24,14 @@ func TestNoNetHttp(t *testing.T) {
 			continue
 		}
 		// Could use something complex like go/build or x/tools/go/packages,
-		// but there's no reason for "net/http" to appear (in quotes) in the source
+		// but there's no reason for http "github.com/sardanioss/http" to appear (in quotes) in the source
 		// otherwise, so just use a simple substring search.
 		data, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Contains(data, []byte(`"net/http"`)) {
-			t.Errorf(`%s: cannot import "net/http"`, file)
+		if bytes.Contains(data, []byte(`http "github.com/sardanioss/http"`)) {
+			t.Errorf(`%s: cannot import http "github.com/sardanioss/http"`, file)
 		}
 	}
 }

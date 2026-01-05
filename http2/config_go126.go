@@ -7,7 +7,7 @@
 package http2
 
 import (
-	"net/http"
+	http "github.com/sardanioss/http"
 )
 
 func http2ConfigStrictMaxConcurrentRequests(h2 *http.HTTP2Config) bool {

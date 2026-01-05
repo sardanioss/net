@@ -9,7 +9,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/http/httptest"
 	"reflect"
 	"sort"

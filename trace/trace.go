@@ -70,7 +70,7 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/url"
 	"runtime"
 	"sort"

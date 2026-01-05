@@ -6,12 +6,12 @@ package websocket
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/http/httptest"
 	"testing"
 	"time"

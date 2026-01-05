@@ -8,7 +8,7 @@ package quic
 
 import (
 	"bytes"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"fmt"
 	"net/netip"
 	"strings"

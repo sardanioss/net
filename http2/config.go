@@ -6,7 +6,7 @@ package http2
 
 import (
 	"math"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"time"
 )
 

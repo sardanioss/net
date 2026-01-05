@@ -7,7 +7,7 @@
 package quic
 
 import (
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"testing"
 	"testing/synctest"
 )

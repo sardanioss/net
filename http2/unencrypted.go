@@ -5,7 +5,7 @@
 package http2
 
 import (
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"net"
 )

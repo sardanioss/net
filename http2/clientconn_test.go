@@ -12,10 +12,10 @@ package http2
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"reflect"
 	"sync/atomic"
 	"testing"

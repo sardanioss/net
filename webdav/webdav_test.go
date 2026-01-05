@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/http/httptest"
 	"net/url"
 	"os"

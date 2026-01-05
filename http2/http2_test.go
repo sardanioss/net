@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"path/filepath"
 	"regexp"

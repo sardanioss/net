@@ -8,7 +8,7 @@ import (
 	"cmp"
 	"context"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"slices"
 	"strings"
 	"testing"

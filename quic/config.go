@@ -5,7 +5,7 @@
 package quic
 
 import (
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"log/slog"
 	"math"
 	"time"

@@ -7,7 +7,7 @@ package quic
 import (
 	"context"
 	cryptorand "crypto/rand"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"fmt"
 	"log/slog"

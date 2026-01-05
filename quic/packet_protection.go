@@ -9,7 +9,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"errors"
 	"hash"
 

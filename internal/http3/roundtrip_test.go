@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"testing"
 	"testing/synctest"
 

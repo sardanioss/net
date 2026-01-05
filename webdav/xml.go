@@ -12,7 +12,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"time"
 
 	// As of https://go-review.googlesource.com/#/c/12772/ which was submitted

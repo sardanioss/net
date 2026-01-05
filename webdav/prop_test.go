@@ -8,7 +8,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"reflect"
 	"regexp"

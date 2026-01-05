@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"go/format"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"os"
 	"regexp"
 	"slices"

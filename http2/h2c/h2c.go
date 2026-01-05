@@ -17,7 +17,7 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/textproto"
 	"os"
 	"strings"

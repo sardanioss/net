@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"testing"
 )
 

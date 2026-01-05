@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/url"
 
 	"github.com/sardanioss/net/http/httpguts"

@@ -8,7 +8,7 @@ package quic
 
 import (
 	"bytes"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"io"
 	"log/slog"
 	"reflect"

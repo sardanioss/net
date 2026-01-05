@@ -9,7 +9,7 @@ package quic
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	tls "github.com/sardanioss/utls"
 	"net/netip"
 	"testing"
 	"testing/synctest"

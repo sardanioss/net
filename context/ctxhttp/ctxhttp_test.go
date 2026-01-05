@@ -9,7 +9,7 @@ package ctxhttp
 import (
 	"context"
 	"io"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"net/http/httptest"
 	"testing"
 	"time"

@@ -10,7 +10,7 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/http"
+	http "github.com/sardanioss/http"
 	"sync"
 )
 
