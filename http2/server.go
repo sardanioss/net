@@ -2262,8 +2262,36 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 
 	header := make(http.Header)
 	rp.Header = header
-	for _, hf := range f.RegularFields() {
-		header.Add(sc.canonicalHeader(hf.Name), hf.Value)
+
+	// Capture pseudo-header order (server-side fingerprinting)
+	pseudoFields := f.PseudoFields()
+	if len(pseudoFields) > 0 {
+		pseudoOrder := make([]string, 0, len(pseudoFields))
+		for _, hf := range pseudoFields {
+			pseudoOrder = append(pseudoOrder, hf.Name)
+		}
+		header[PHeaderOrderKey] = pseudoOrder
+	}
+
+	// Capture regular header order and add headers (server-side fingerprinting)
+	regularFields := f.RegularFields()
+	if len(regularFields) > 0 {
+		headerOrder := make([]string, 0, len(regularFields))
+		seen := make(map[string]bool)
+		for _, hf := range regularFields {
+			header.Add(sc.canonicalHeader(hf.Name), hf.Value)
+			// Track unique headers in order (avoid duplicates from multi-value headers)
+			lowerName := strings.ToLower(hf.Name)
+			if !seen[lowerName] {
+				headerOrder = append(headerOrder, lowerName)
+				seen[lowerName] = true
+			}
+		}
+		header[HeaderOrderKey] = headerOrder
+	} else {
+		for _, hf := range f.RegularFields() {
+			header.Add(sc.canonicalHeader(hf.Name), hf.Value)
+		}
 	}
 	if rp.Authority == "" {
 		rp.Authority = header.Get("Host")

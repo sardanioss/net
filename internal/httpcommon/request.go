@@ -186,6 +186,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		}
 
 		var didUA bool
+		var didContentLength bool
 
 		// Helper to process a single header
 		processHeader := func(k string, vv []string) {
@@ -193,9 +194,12 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			if k == "Header-Order:" || k == "PHeader-Order:" {
 				return
 			}
-			if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
+			if asciiEqualFold(k, "host") {
 				// Host is :authority, already sent.
-				// Content-Length is automatic, set below.
+				return
+			} else if asciiEqualFold(k, "content-length") {
+				// Content-Length is handled separately - either via HeaderOrder loop
+				// or at the end. Never send it from processHeader.
 				return
 			} else if asciiEqualFold(k, "connection") ||
 				asciiEqualFold(k, "proxy-connection") ||
@@ -258,6 +262,14 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			// First, process headers in the specified order
 			processedHeaders := make(map[string]bool)
 			for _, k := range param.HeaderOrder {
+				// Special case: content-length is not in req.Header but we handle it
+				if asciiEqualFold(k, "content-length") {
+					if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+						f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
+						didContentLength = true
+					}
+					continue
+				}
 				// Find the header (case-insensitive match)
 				for hk, vv := range req.Header {
 					if asciiEqualFold(hk, k) && !processedHeaders[hk] {
@@ -284,7 +296,8 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 				processHeader(k, req.Header[k])
 			}
 		}
-		if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+		// Only send content-length here if not already sent via HeaderOrder
+		if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
 			f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
 		}
 		if param.AddGzipHeader {
