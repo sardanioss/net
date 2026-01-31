@@ -972,6 +972,13 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		cc.fr.countError = t.CountError
 	}
 	maxHeaderTableSize := conf.MaxDecoderHeaderTableSize
+	// If custom Settings contain HeaderTableSize, use that for the decoder
+	// to match what we advertise to the server
+	if t.Settings != nil {
+		if customSize, ok := t.Settings[SettingHeaderTableSize]; ok && customSize > maxHeaderTableSize {
+			maxHeaderTableSize = customSize
+		}
+	}
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(maxHeaderTableSize, nil)
 	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()
 
