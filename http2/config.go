@@ -92,13 +92,14 @@ func configFromTransport(h2 *Transport) http2Config {
 		}
 	}
 
-	// Auto-derive encoder table size limit from custom SETTINGS_HEADER_TABLE_SIZE.
-	// We advertise this as our decoder table size, but should also allow our
-	// encoder to use up to this size when the server permits it. Without this,
-	// the encoder caps at 4096 even when servers allow larger tables, producing
+	// Auto-derive HPACK table sizes from custom SETTINGS_HEADER_TABLE_SIZE.
+	// The advertised value controls both our decoder capacity and our encoder
+	// limit. Without this, both default to 4096 even when the preset advertises
+	// 65536, causing COMPRESSION_ERROR when servers use the larger table, and
 	// different HPACK dynamic table behavior than Chrome.
 	if hts, ok := h2.Settings[SettingHeaderTableSize]; ok && hts > 0 {
 		if hts <= 1<<30 { // cap at 1GB
+			conf.MaxDecoderHeaderTableSize = hts
 			conf.MaxEncoderHeaderTableSize = hts
 		}
 	}
