@@ -989,6 +989,9 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
+	cc.henc.SetIndexingPolicy(t.HPACKIndexingPolicy)
+	cc.henc.SetNeverIndexHeaders(t.HPACKNeverIndex)
+	cc.henc.SetAlwaysIndexHeaders(t.HPACKAlwaysIndex)
 	cc.peerMaxHeaderTableSize = initialHeaderTableSize
 
 	if cs, ok := c.(connectionStater); ok {
