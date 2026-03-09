@@ -82,6 +82,27 @@ func configFromTransport(h2 *Transport) http2Config {
 		conf.MaxReadFrameSize = maxFrameSize
 	}
 
+	// Auto-derive stream receive buffer from custom SETTINGS_INITIAL_WINDOW_SIZE.
+	// This ensures WINDOW_UPDATE thresholds match the advertised window size,
+	// preventing fingerprint mismatch (e.g. Chrome sends 6MB IWS but default
+	// buffer is 4MB, causing more frequent WINDOW_UPDATEs than Chrome).
+	if iws, ok := h2.Settings[SettingInitialWindowSize]; ok && iws > 0 {
+		if iws <= 1<<30 { // cap at 1GB
+			conf.MaxUploadBufferPerStream = int32(iws)
+		}
+	}
+
+	// Auto-derive encoder table size limit from custom SETTINGS_HEADER_TABLE_SIZE.
+	// We advertise this as our decoder table size, but should also allow our
+	// encoder to use up to this size when the server permits it. Without this,
+	// the encoder caps at 4096 even when servers allow larger tables, producing
+	// different HPACK dynamic table behavior than Chrome.
+	if hts, ok := h2.Settings[SettingHeaderTableSize]; ok && hts > 0 {
+		if hts <= 1<<30 { // cap at 1GB
+			conf.MaxEncoderHeaderTableSize = hts
+		}
+	}
+
 	if h2.t1 != nil {
 		fillNetHTTPConfig(&conf, h2.t1.HTTP2)
 	}
