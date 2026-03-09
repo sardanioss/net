@@ -155,6 +155,11 @@ type Transport struct {
 	// If nil, headers are sent in the order they appear in the request.
 	HeaderOrder []string
 
+	// DisableCookieSplit, when true, sends the Cookie header as a single
+	// HPACK entry instead of splitting on semicolons per RFC 9113 §8.2.3.
+	// Chrome sends cookies as one entry; splitting is detectable by servers.
+	DisableCookieSplit bool
+
 	// UserAgent specifies the default User-Agent header to send when the request
 	// doesn't contain one. If empty, uses "Go-http-client/2.0".
 	// Set this to match the browser profile being fingerprinted.
@@ -1777,7 +1782,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
 	cc.hbuf.Reset()
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, func(name, value string) {
+	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, func(name, value string) {
 		cc.writeHeader(name, value)
 	})
 	if err != nil {
@@ -1793,7 +1798,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	return err
 }
 
-func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
 	// Check for per-request magic keys (compatible with bogdanfinn/fhttp)
 	// These override transport-level settings
 	effectivePseudoOrder := pseudoHeaderOrder
@@ -1826,6 +1831,7 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 		DefaultUserAgent:      effectiveUserAgent,
 		PseudoHeaderOrder:     effectivePseudoOrder,
 		HeaderOrder:           effectiveHeaderOrder,
+		DisableCookieSplit:    disableCookieSplit,
 	}, headerf)
 }
 
