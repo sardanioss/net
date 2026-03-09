@@ -58,6 +58,11 @@ type EncodeHeadersParam struct {
 	// HeaderOrder specifies the order in which regular headers should be sent.
 	// If nil, headers are sent in sorted order.
 	HeaderOrder []string
+
+	// DisableCookieSplit, when true, sends the Cookie header as a single
+	// HPACK entry instead of splitting on semicolons per RFC 9113 §8.2.3.
+	// Chrome sends cookies as one entry; splitting is detectable by servers.
+	DisableCookieSplit bool
 }
 
 // EncodeHeadersResult is the result of EncodeHeaders.
@@ -225,28 +230,31 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 					return
 				}
 			} else if asciiEqualFold(k, "cookie") {
-				// Per 8.1.2.5 To allow for better compression efficiency, the
-				// Cookie header field MAY be split into separate header fields,
-				// each with one or more cookie-pairs.
-				for _, v := range vv {
-					for {
-						p := strings.IndexByte(v, ';')
-						if p < 0 {
-							break
-						}
-						f("cookie", v[:p])
-						p++
-						// strip space after semicolon if any.
-						for p+1 <= len(v) && v[p] == ' ' {
+				if !param.DisableCookieSplit {
+					// Per 8.1.2.5 To allow for better compression efficiency, the
+					// Cookie header field MAY be split into separate header fields,
+					// each with one or more cookie-pairs.
+					for _, v := range vv {
+						for {
+							p := strings.IndexByte(v, ';')
+							if p < 0 {
+								break
+							}
+							f("cookie", v[:p])
 							p++
+							// strip space after semicolon if any.
+							for p+1 <= len(v) && v[p] == ' ' {
+								p++
+							}
+							v = v[p:]
 						}
-						v = v[p:]
+						if len(v) > 0 {
+							f("cookie", v)
+						}
 					}
-					if len(v) > 0 {
-						f("cookie", v)
-					}
+					return
 				}
-				return
+				// DisableCookieSplit: fall through to send full cookie as one entry
 			} else if k == ":protocol" {
 				// :protocol pseudo-header was already sent above.
 				return
