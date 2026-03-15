@@ -2271,7 +2271,14 @@ func (cc *ClientConn) writeHeader(name, value string) {
 	if VerboseLogs {
 		log.Printf("http2: Transport encoding header %q = %q", name, value)
 	}
-	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+	f := hpack.HeaderField{Name: name, Value: value}
+	// Mark headers in the NeverIndex list as Sensitive so they use the
+	// "never indexed" HPACK representation (0x10 prefix) on the wire,
+	// matching Chrome's behavior for cookie/authorization headers.
+	if cc.henc.NeverIndexHeaders != nil && cc.henc.NeverIndexHeaders[name] {
+		f.Sensitive = true
+	}
+	cc.henc.WriteField(f)
 }
 
 type resAndError struct {
