@@ -151,6 +151,22 @@ type Transport struct {
 	// If non-nil, the PRIORITY flag is set on HEADERS frames.
 	HeaderPriority *PriorityParam
 
+	// HeaderPriorityFunc, if non-nil, is called per-request to compute the
+	// priority to include in that request's HEADERS frame. It takes
+	// precedence over HeaderPriority — if both are set, HeaderPriorityFunc
+	// is consulted first; if it returns nil, the transport falls back to
+	// HeaderPriority. If both are nil, no PRIORITY flag is emitted.
+	//
+	// The callback receives the *http.Request being sent. This allows the
+	// caller to vary the priority by request attributes (for example, the
+	// sec-fetch-dest header for browser-impersonation fingerprints, where
+	// each resource type has a different RFC 7540 stream weight).
+	//
+	// The callback must be goroutine-safe: multiple concurrent requests on
+	// the same connection may call it simultaneously. Avoid mutating the
+	// request inside the callback.
+	HeaderPriorityFunc func(req *http.Request) *PriorityParam
+
 	// HeaderOrder specifies the order in which regular headers should be sent.
 	// If nil, headers are sent in the order they appear in the request.
 	HeaderOrder []string
@@ -1793,10 +1809,24 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	}
 	hdrs := cc.hbuf.Bytes()
 
+	// Resolve per-request priority. HeaderPriorityFunc takes precedence;
+	// if it is nil or returns nil, fall back to the static HeaderPriority.
+	// This keeps backwards compatibility for callers that only set
+	// HeaderPriority while enabling per-request priority frames (e.g. RFC
+	// 7540 weight derived from sec-fetch-dest) for callers that wire up
+	// the callback.
+	var priority *PriorityParam
+	if cc.t.HeaderPriorityFunc != nil {
+		priority = cc.t.HeaderPriorityFunc(req)
+	}
+	if priority == nil {
+		priority = cc.t.HeaderPriority
+	}
+
 	// Write the request.
 	endStream := !res.HasBody && !res.HasTrailers
 	cs.sentHeaders = true
-	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, priority)
 	traceWroteHeaders(cs.trace)
 	return err
 }
@@ -1975,7 +2005,12 @@ func (cc *ClientConn) awaitOpenSlotForStreamLocked(cs *clientStream) error {
 }
 
 // requires cc.wmu be held
-func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
+//
+// priority, if non-nil, is included in the (first) HEADERS frame's PRIORITY
+// fields. It is the caller's responsibility to resolve any per-request
+// HeaderPriorityFunc / fallback HeaderPriority precedence; writeHeaders
+// itself only consumes the resolved value.
+func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte, priority *PriorityParam) error {
 	first := true // first frame written (HEADERS is first, then CONTINUATION)
 	for len(hdrs) > 0 && cc.werr == nil {
 		chunk := hdrs
@@ -1993,8 +2028,8 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 			}
 			// Add priority information if configured (for fingerprinting)
 			// Chrome includes priority in HEADERS frame with weight=256, exclusive=1, depends_on=0
-			if cc.t.HeaderPriority != nil {
-				param.Priority = *cc.t.HeaderPriority
+			if priority != nil {
+				param.Priority = *priority
 			}
 			cc.fr.WriteHeaders(param)
 			first = false
@@ -2185,7 +2220,8 @@ func (cs *clientStream) writeRequestBody(req *http.Request) (err error) {
 	// Two ways to send END_STREAM: either with trailers, or
 	// with an empty DATA frame.
 	if len(trls) > 0 {
-		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls)
+		// Trailers never carry RFC 7540 PRIORITY data.
+		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls, nil)
 	} else {
 		err = cc.fr.WriteData(cs.ID, true, nil)
 	}
