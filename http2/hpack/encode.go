@@ -210,53 +210,38 @@ func (e *Encoder) shouldIndex(f HeaderField) bool {
 	}
 }
 
-// chromeIndexingBehavior emulates Chrome's HPACK indexing decisions.
-// Chrome has specific patterns for which headers it indexes to avoid
-// dynamic table pollution and match browser fingerprint.
+// chromeIndexingBehavior is a port of Chromium's HPACK encoder policy, from
+// quiche/http2/hpack/hpack_encoder.cc:
+//
+//	bool DefaultPolicy(absl::string_view name, absl::string_view /* value */) {
+//	  if (name.empty()) return false;
+//	  if (name[0] == kPseudoHeaderPrefix) {
+//	    return name == ":authority";
+//	  }
+//	  return true;
+//	}
+//
+// Every regular header is indexed, including cookie and authorization, and
+// including large values: Chrome inserts a 480-character _abck cookie crumb and
+// references it with one byte on the next request. There is no size threshold
+// and no per-name exclusion list; adding either diverges from Chrome on every
+// request after the first, which is the opposite of what such a list looks like
+// it is doing.
+//
+// The one pseudo-header Chrome indexes is :authority. The other pseudo-headers
+// it sends are full static-table value matches (:method GET/POST, :scheme
+// https, :path /), so their indexing decision is never reached and excluding
+// them looks harmless right up until :authority, which is not a value match and
+// therefore has to go out as a literal.
 func (e *Encoder) chromeIndexingBehavior(f HeaderField) bool {
 	name := f.Name
-
-	// Pseudo-headers - Chrome uses static table references, doesn't index
-	if len(name) > 0 && name[0] == ':' {
+	if name == "" {
 		return false
 	}
-
-	// Headers Chrome typically doesn't index (values change frequently)
-	switch name {
-	case "cookie", "set-cookie":
-		return false
-	case "date", "last-modified", "expires":
-		return false
-	case "etag", "if-none-match", "if-modified-since":
-		return false
-	case "content-length", "content-range":
-		return false
-	case "age", "x-request-id", "x-correlation-id":
-		return false
-	case "authorization", "proxy-authorization":
-		return false
+	if name[0] == ':' {
+		return name == ":authority"
 	}
-
-	// Headers Chrome typically indexes (values are stable)
-	switch name {
-	case "accept", "accept-encoding", "accept-language":
-		return true
-	case "user-agent":
-		return true
-	case "cache-control", "pragma":
-		return true
-	case "content-type":
-		return true
-	case "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform":
-		return true
-	case "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user":
-		return true
-	case "upgrade-insecure-requests":
-		return true
-	}
-
-	// Default: index if value is reasonably short (Chrome heuristic)
-	return len(f.Value) < 128
+	return true
 }
 
 // SetIndexingPolicy sets the indexing policy for this encoder.

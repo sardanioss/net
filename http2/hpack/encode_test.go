@@ -107,16 +107,19 @@ func TestEncoderSearchTable(t *testing.T) {
 		{pair("blake", "miz"), uint64(staticTable.len()) + 2, true},
 		{pair(":method", "GET"), 2, true},
 
-		// Only name match because Sensitive == true. This is allowed to match
-		// any ":method" entry. The current implementation uses the last entry
-		// added in newStaticTable.
-		{HeaderField{":method", "GET", true}, 3, false},
+		// Only name match because Sensitive == true. RFC 7541 allows this to
+		// match any ":method" entry. Upstream x/net picks the last one added;
+		// this fork picks the FIRST, matching quiche hpack_static_table.cc,
+		// because Chrome is the fingerprint being reproduced and a last-wins
+		// pick puts :method: POST (3) and :path: /index.html (5) on the wire
+		// where Chrome puts 2 and 4.
+		{HeaderField{":method", "GET", true}, 2, false},
 
 		// Only Name matches
 		{pair("foo", "..."), uint64(staticTable.len()) + 3, false},
 		{pair("blake", "..."), uint64(staticTable.len()) + 2, false},
-		// As before, this is allowed to match any ":method" entry.
-		{pair(":method", "..."), 3, false},
+		// As before, any ":method" entry is allowed; first-wins here.
+		{pair(":method", "..."), 2, false},
 
 		// None match
 		{pair("foo-", "bar"), 0, false},

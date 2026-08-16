@@ -5,12 +5,19 @@ package hpack
 
 var staticTable = &headerFieldTable{
 	evictCount: 0,
+	// byName maps a header name to the FIRST static entry carrying it, matching
+	// quiche hpack_static_table.cc, whose static_name_index_.insert() does not
+	// overwrite an existing key ("Multiple static entries may have the same
+	// name, so inserts may fail"). Only :method, :path, :scheme and :status have
+	// duplicate names. Last-wins here makes a non-GET method reference
+	// :method: POST and a non-root path reference :path: /index.html, which is a
+	// one-byte-per-request divergence from Chrome on the wire.
 	byName: map[string]uint64{
 		":authority":                  1,
-		":method":                     3,
-		":path":                       5,
-		":scheme":                     7,
-		":status":                     14,
+		":method":                     2,
+		":path":                       4,
+		":scheme":                     6,
+		":status":                     8,
 		"accept-charset":              15,
 		"accept-encoding":             16,
 		"accept-language":             17,
