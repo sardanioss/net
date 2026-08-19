@@ -13,9 +13,11 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
-	tls "github.com/sardanioss/utls"
 	"errors"
 	"fmt"
+	http "github.com/sardanioss/http"
+	"github.com/sardanioss/http/httptrace"
+	tls "github.com/sardanioss/utls"
 	"io"
 	"io/fs"
 	"log"
@@ -23,8 +25,6 @@ import (
 	"math/bits"
 	mathrand "math/rand"
 	"net"
-	http "github.com/sardanioss/http"
-	"github.com/sardanioss/http/httptrace"
 	"net/textproto"
 	"strconv"
 	"strings"
@@ -193,6 +193,12 @@ type Transport struct {
 	// HPACKIndexingPolicy controls how the HPACK encoder indexes headers.
 	// Use hpack.IndexingChrome for Chrome-like behavior.
 	HPACKIndexingPolicy hpack.IndexingPolicy
+
+	// HPACKRepresentations pins the HPACK representation of individual header
+	// names. It is an override layer: empty for a browser profile, whose base
+	// policy is already correct, and carrying only the names where a mirrored
+	// client demonstrably differs. See hpack.Encoder.Representations.
+	HPACKRepresentations map[string]hpack.Representation
 
 	// HPACKNeverIndex is a list of header names that should never be indexed.
 	HPACKNeverIndex []string
@@ -1006,6 +1012,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
 	cc.henc.SetIndexingPolicy(t.HPACKIndexingPolicy)
+	cc.henc.SetHeaderRepresentations(t.HPACKRepresentations)
 	cc.henc.SetNeverIndexHeaders(t.HPACKNeverIndex)
 	cc.henc.SetAlwaysIndexHeaders(t.HPACKAlwaysIndex)
 	cc.peerMaxHeaderTableSize = initialHeaderTableSize

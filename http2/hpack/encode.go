@@ -57,8 +57,28 @@ type Encoder struct {
 	// If set, this takes precedence over IndexPolicy.
 	CustomIndexingFunc IndexingFunc
 
+	// Representations pins the HPACK representation for individual header
+	// names, overriding IndexPolicy, CustomIndexingFunc and both lists below.
+	//
+	// It is an OVERRIDE LAYER and is expected to be empty for a browser
+	// profile, whose base policy is already correct. It exists for mirroring a
+	// client whose representation choices differ from that policy on specific
+	// names, and should carry only those deltas. Populating it from raw
+	// observation makes every profile restate its own policy and go stale the
+	// moment the policy improves.
+	//
+	// Representation is a per-NAME rule in every stack examined, not an
+	// arbitrary per-header choice, which is why a name-keyed map is the right
+	// shape. Both curl and Chrome send :path as a literal without indexing
+	// because paths vary and would pollute the table; curl never-indexes
+	// authorization while Chrome indexes it like anything else.
+	Representations map[string]Representation
+
 	// NeverIndexHeaders is a set of header names that should never be indexed.
 	// This is useful for fingerprinting as Chrome never indexes certain headers.
+	//
+	// Equivalent to a Representations entry of RepresentationNever, kept
+	// because it predates the map.
 	NeverIndexHeaders map[string]bool
 
 	// AlwaysIndexHeaders is a set of header names that should always be indexed.
@@ -84,6 +104,7 @@ func NewEncoder(w io.Writer) *Encoder {
 // if necessary. If produced, it is done before encoding f.
 func (e *Encoder) WriteField(f HeaderField) error {
 	e.buf = e.buf[:0]
+	suppressExactMatch := false
 
 	if e.tableSizeUpdate {
 		e.tableSizeUpdate = false
@@ -92,6 +113,25 @@ func (e *Encoder) WriteField(f HeaderField) error {
 		}
 		e.minSize = uint32Max
 		e.buf = appendTableSize(e.buf, e.dynTab.maxSize)
+	}
+
+	// A pinned representation is resolved before anything else looks at the
+	// field, because two of the three choices have to suppress the exact-match
+	// lookup below as well as the indexing decision.
+	forceIncremental := false
+	if rep, ok := e.Representations[f.Name]; ok {
+		switch rep {
+		case RepresentationNever:
+			f.Sensitive = true
+		case RepresentationWithout:
+			// 6.2.2 is a literal, so an indexed reference is not allowed even
+			// when the table holds an identical field. searchTable only skips
+			// its name-and-value lookup for sensitive fields, so this one has
+			// to be suppressed explicitly.
+			suppressExactMatch = true
+		case RepresentationIncremental:
+			forceIncremental = true
+		}
 	}
 
 	// The never-index list has to be resolved into f.Sensitive here, before
@@ -114,10 +154,13 @@ func (e *Encoder) WriteField(f HeaderField) error {
 	}
 
 	idx, nameValueMatch := e.searchTable(f)
-	if nameValueMatch {
+	if nameValueMatch && !suppressExactMatch {
 		e.buf = appendIndexed(e.buf, idx)
 	} else {
-		indexing := e.shouldIndex(f)
+		indexing := forceIncremental || e.shouldIndex(f)
+		if suppressExactMatch {
+			indexing = false // 6.2.2 does not add to the dynamic table
+		}
 		if indexing {
 			e.dynTab.add(f)
 		}
@@ -266,6 +309,55 @@ func (e *Encoder) chromeIndexingBehavior(f HeaderField) bool {
 // SetIndexingPolicy sets the indexing policy for this encoder.
 func (e *Encoder) SetIndexingPolicy(policy IndexingPolicy) {
 	e.IndexPolicy = policy
+}
+
+// Representation names the HPACK representation an encoder must use for a
+// header field, using RFC 7541's own vocabulary.
+type Representation uint8
+
+const (
+	// RepresentationDefault leaves the choice to the indexing policy.
+	RepresentationDefault Representation = iota
+	// RepresentationIncremental is "Literal Header Field with Incremental
+	// Indexing" (6.2.1), prefix 0x40. The field is added to the dynamic table,
+	// so a later identical field can be sent as an indexed reference.
+	RepresentationIncremental
+	// RepresentationWithout is "Literal Header Field without Indexing"
+	// (6.2.2), prefix 0x00. Never added to the table, and never sent as an
+	// indexed reference even when the table already holds an identical field.
+	RepresentationWithout
+	// RepresentationNever is "Literal Header Field Never Indexed" (6.2.3),
+	// prefix 0x10. As above, plus an instruction to intermediaries not to
+	// index it either.
+	RepresentationNever
+)
+
+// ParseRepresentation maps a configuration string to a Representation.
+// "default" and the empty string both mean "leave it to the policy".
+func ParseRepresentation(s string) (Representation, bool) {
+	switch s {
+	case "", "default":
+		return RepresentationDefault, true
+	case "incremental", "indexed":
+		return RepresentationIncremental, true
+	case "without", "without_indexing":
+		return RepresentationWithout, true
+	case "never", "never_indexed":
+		return RepresentationNever, true
+	}
+	return RepresentationDefault, false
+}
+
+// SetHeaderRepresentations pins the representation for individual header names.
+func (e *Encoder) SetHeaderRepresentations(m map[string]Representation) {
+	if len(m) == 0 {
+		e.Representations = nil
+		return
+	}
+	e.Representations = make(map[string]Representation, len(m))
+	for k, v := range m {
+		e.Representations[k] = v
+	}
 }
 
 // SetCustomIndexingFunc sets a custom function for indexing decisions.
