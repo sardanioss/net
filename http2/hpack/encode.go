@@ -94,6 +94,25 @@ func (e *Encoder) WriteField(f HeaderField) error {
 		e.buf = appendTableSize(e.buf, e.dynTab.maxSize)
 	}
 
+	// The never-index list has to be resolved into f.Sensitive here, before
+	// anything else looks at the field. Sensitive is what the rest of the
+	// encoder keys off: encodeTypeByte turns it into the 0x10 prefix (RFC 7541
+	// 6.2.3), shouldIndex refuses to add the field to the dynamic table, and
+	// headerFieldTable.search skips the name-and-value lookup so the field can
+	// never go out as an indexed reference. A name-only index is still used,
+	// which 6.2.3 allows.
+	//
+	// Setting it only inside shouldIndex, as before, reached none of that: the
+	// field went out as 0x00, "without indexing", which is a different
+	// instruction to the peer than the method name promises.
+	//
+	// This deliberately outranks CustomIndexingFunc and AlwaysIndexHeaders.
+	// The settings contradict each other, and an explicit "never index this"
+	// is the one carrying a security meaning, so it wins.
+	if !f.Sensitive && e.NeverIndexHeaders != nil && e.NeverIndexHeaders[f.Name] {
+		f.Sensitive = true
+	}
+
 	idx, nameValueMatch := e.searchTable(f)
 	if nameValueMatch {
 		e.buf = appendIndexed(e.buf, idx)
@@ -254,7 +273,15 @@ func (e *Encoder) SetCustomIndexingFunc(fn IndexingFunc) {
 	e.CustomIndexingFunc = fn
 }
 
-// SetNeverIndexHeaders sets headers that should never be indexed.
+// SetNeverIndexHeaders sets headers that must be emitted with the "Literal
+// Header Field Never Indexed" representation (RFC 7541 6.2.3), the 0x10
+// prefix. Such a field is never added to the dynamic table and is never sent
+// as an indexed reference, even when an identical name and value pair is
+// already in the static or dynamic table.
+//
+// Most browsers set nothing here. Chrome in particular indexes cookie and
+// authorization like any other header, so a Chrome-shaped profile wants this
+// list empty rather than populated "for safety".
 func (e *Encoder) SetNeverIndexHeaders(headers []string) {
 	e.NeverIndexHeaders = make(map[string]bool)
 	for _, h := range headers {
