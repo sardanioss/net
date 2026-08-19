@@ -2659,6 +2659,21 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		StatusCode: statusCode,
 		Status:     status + " " + http.StatusText(statusCode),
 	}
+	// Record the order the fields arrived in. http.Header is a map, so without
+	// this the wire order is gone by the time anyone reads the response, and a
+	// caller relaying it onward emits a different header sequence than the
+	// origin sent. Same HeaderOrderKey convention the write path uses.
+	//
+	// Names are already lowercase on an HTTP/2 wire, so this captures order
+	// only; there is no original casing to lose here.
+	if len(regularFields) > 0 {
+		order := make([]string, 0, len(regularFields))
+		for _, hf := range regularFields {
+			order = append(order, hf.Name)
+		}
+		header[http.HeaderOrderKey] = order
+	}
+
 	for _, hf := range regularFields {
 		key := httpcommon.CanonicalHeader(hf.Name)
 		if key == "Trailer" {
