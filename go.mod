@@ -3,7 +3,7 @@ module github.com/sardanioss/net
 go 1.24.0
 
 require (
-	github.com/sardanioss/http v1.1.0
+	github.com/sardanioss/http v1.2.0
 	github.com/sardanioss/utls v1.9.0
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sys v0.39.0
