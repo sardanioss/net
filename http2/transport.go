@@ -192,6 +192,23 @@ type Transport struct {
 
 	// HPACKIndexingPolicy controls how the HPACK encoder indexes headers.
 	// Use hpack.IndexingChrome for Chrome-like behavior.
+	// DataFrameMaxSize caps the payload of a DATA frame this transport will
+	// send. Zero means no cap beyond the peer's SETTINGS_MAX_FRAME_SIZE, which
+	// is the Go default and what Firefox and the WebKit family do.
+	//
+	// Chromium uses 16375, which is 16384 minus the 9-byte frame header, so that
+	// header plus payload land inside exactly one 16KB TLS record. Writing the
+	// full 16384 makes the frame 16393 bytes, which the record layer splits into
+	// a 16401-byte record and a 26-byte one, and that little tail then repeats
+	// on every frame for the life of the connection.
+	//
+	// Chromium also ignores the peer's SETTINGS_MAX_FRAME_SIZE for this; its
+	// chunk size is a compile-time constant. So this is a hard cap, not a
+	// smaller default: a peer advertising a LARGER frame size must not raise it.
+	// A peer advertising a SMALLER one still wins, because that is a protocol
+	// requirement rather than a preference.
+	DataFrameMaxSize uint32
+
 	HPACKIndexingPolicy hpack.IndexingPolicy
 
 	// HPACKRepresentations pins the HPACK representation of individual header
@@ -2117,6 +2134,18 @@ func (cs *clientStream) writeRequestBody(req *http.Request) (err error) {
 	cc.mu.Lock()
 	maxFrameSize := int(cc.maxFrameSize)
 	cc.mu.Unlock()
+
+	// Cap the DATA payload, if the profile asks for one. Deliberately applied
+	// HERE and not where cc.maxFrameSize is assigned from the peer's SETTINGS:
+	// that same field also sizes HEADERS and CONTINUATION frames a few hundred
+	// lines up, and Chromium's control-frame limit is not this number. Clamping
+	// at the assignment site is the tidier-looking change and it would chunk
+	// header blocks at a size neither Go nor a browser uses.
+	//
+	// min(), so a peer advertising a smaller frame size still wins.
+	if cap := int(cc.t.DataFrameMaxSize); cap > 0 && cap < maxFrameSize {
+		maxFrameSize = cap
+	}
 
 	// Scratch buffer for reading into & writing from.
 	scratchLen := cs.frameScratchBufferLen(maxFrameSize)
