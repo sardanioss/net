@@ -1159,15 +1159,33 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	return cc, nil
 }
 
-// maxPendingResets bounds the reset back-pressure counter.
+// maxPendingResets is the absolute ceiling on the reset back-pressure counter.
+const maxPendingResets = 32
+
+// pendingResetLimit is how far the reset back-pressure counter may climb on a
+// connection whose peer allows maxConcurrent streams.
 //
 // The counter used to be cleared by the ack to the PING that rode along with
 // every RST_STREAM. That PING is gone, and so is the 90-second health check
 // whose ack also cleared it, so the only thing left is a frame arriving from
-// the peer. A peer that acks nothing and sends nothing would otherwise hold
-// the connection at its concurrency limit for ever. Bounding it means the
-// worst case is reduced throughput on one connection rather than a wedge.
-const maxPendingResets = 32
+// the peer. A peer that acks nothing and sends nothing must not be able to
+// hold the connection at its limit for ever, because the counter feeds
+// currentRequestCountLocked and the slot wait parks on a condition variable
+// with no timeout: every later request would then block to its own deadline.
+//
+// A flat ceiling does not achieve that. It has to be relative to the peer's
+// limit, because a peer advertising fewer streams than the ceiling reaches
+// saturation on resets alone. Half the limit keeps the back-pressure this
+// counter exists for while guaranteeing the connection can always make
+// progress, and a peer allowing one stream at a time gets no back-pressure at
+// all rather than a wedge.
+func pendingResetLimit(maxConcurrent uint32) int {
+	limit := int(maxConcurrent / 2)
+	if limit > maxPendingResets {
+		limit = maxPendingResets
+	}
+	return limit
+}
 
 func (t *Transport) prefacePingIdle() time.Duration {
 	return t.PrefacePingIdle
@@ -2128,7 +2146,7 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 				// the peer says anything at all.
 				if !closeOnIdle && !readSinceStream {
 					cc.mu.Lock()
-					if cc.pendingResets < maxPendingResets {
+					if cc.pendingResets < pendingResetLimit(cc.maxConcurrentStreams) {
 						cc.pendingResets++
 					}
 					cc.mu.Unlock()
