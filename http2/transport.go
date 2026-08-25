@@ -13,6 +13,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	http "github.com/sardanioss/http"
@@ -280,6 +281,27 @@ type Transport struct {
 	// If zero, no health check is performed.
 	ReadIdleTimeout time.Duration
 
+	// PrefacePingIdle, when non-zero, sends a PING alongside a request issued
+	// on a connection whose peer has not been heard from for at least this
+	// long. Chromium calls this a preface ping and sets the threshold with
+	// kSpdyDefaultConnectionAtRiskOfLossSeconds, which is 10 seconds.
+	//
+	// At most one preface ping is outstanding at a time, and the payload is a
+	// big-endian counter starting at 1, not random bytes.
+	PrefacePingIdle time.Duration
+
+	// PrefacePingHang is how long to tolerate silence from the peer while a
+	// preface ping is outstanding before treating the connection as hung and
+	// closing it. Zero falls back to PrefacePingIdle. Chromium's equivalent is
+	// hung_interval_, also 10 seconds.
+	//
+	// This is not optional decoration. Without it the at-most-one-in-flight
+	// rule leaks an unbounded sequence: a peer that goes permanently silent
+	// gets one ping and then a close from a browser, and an unbounded counted
+	// sequence from us, which is a cleaner discriminator than the one the
+	// preface ping removes.
+	PrefacePingHang time.Duration
+
 	// PingTimeout is the timeout after which the connection will be closed
 	// if a response to Ping is not received.
 	// Defaults to 15s.
@@ -490,12 +512,30 @@ func (t *Transport) initConnPool() {
 // ClientConn is the state of a single HTTP/2 client connection to an
 // HTTP/2 server.
 type ClientConn struct {
-	t             *Transport
-	tconn         net.Conn             // usually *tls.Conn, except specialized impls
-	tlsState      *tls.ConnectionState // nil only for specialized impls
-	atomicReused  uint32               // whether conn is being reused; atomic
-	singleUse     bool                 // whether being used for a single http.Request
-	getConnCalled bool                 // used by clientConnPool
+	t            *Transport
+	tconn        net.Conn             // usually *tls.Conn, except specialized impls
+	tlsState     *tls.ConnectionState // nil only for specialized impls
+	atomicReused uint32               // whether conn is being reused; atomic
+
+	// lastReadNano is when the most recent frame was read from the peer, as
+	// UnixNano. Atomic and deliberately out here rather than in the
+	// mutex-guarded block below: it is stored once per frame and read on the
+	// request path, and neither should have to take a lock or share a cache
+	// line with one.
+	lastReadNano atomic.Int64
+
+	// prefacePingInFlight is Chromium's ping_in_flight_. At most one preface
+	// ping is outstanding at a time. Set under wmu when the ping is written,
+	// cleared from the read loop on any PING ack.
+	prefacePingInFlight atomic.Bool
+
+	// hangTimer watches for a peer that goes silent while a preface ping is
+	// outstanding. An atomic pointer rather than a plain field because the
+	// read loop's teardown stops it without holding either mutex, the same way
+	// it stops idleTimer.
+	hangTimer     atomic.Pointer[time.Timer]
+	singleUse     bool // whether being used for a single http.Request
+	getConnCalled bool // used by clientConnPool
 
 	// readLoop goroutine fields:
 	readerDone chan struct{} // closed on error
@@ -537,22 +577,16 @@ type ClientConn struct {
 	extendedConnectAllowed      bool
 	strictMaxConcurrentStreams  bool
 
-	// rstStreamPingsBlocked works around an unfortunate gRPC behavior.
-	// gRPC strictly limits the number of PING frames that it will receive.
-	// The default is two pings per two hours, but the limit resets every time
-	// the gRPC endpoint sends a HEADERS or DATA frame. See golang/go#70575.
+	// pendingResets is the number of RST_STREAM frames we have sent to the peer
+	// without any sign that the peer is still there. We count them against the
+	// connection's concurrency limit, which limits how many requests we will
+	// try to send down a completely unresponsive connection.
 	//
-	// rstStreamPingsBlocked is set after receiving a response to a PING frame
-	// bundled with an RST_STREAM (see pendingResets below), and cleared after
-	// receiving a HEADERS or DATA frame.
-	rstStreamPingsBlocked bool
-
-	// pendingResets is the number of RST_STREAM frames we have sent to the peer,
-	// without confirming that the peer has received them. When we send a RST_STREAM,
-	// we bundle it with a PING frame, unless a PING is already in flight. We count
-	// the reset stream against the connection's concurrency limit until we get
-	// a PING response. This limits the number of requests we'll try to send to a
-	// completely unresponsive connection.
+	// It used to be cleared by the ack to a PING bundled with the RST_STREAM.
+	// That PING is gone, so any frame at all from the peer clears it instead,
+	// which is a broader and cheaper proof of the same thing. It is also
+	// bounded, because it is no longer the case that some other mechanism is
+	// guaranteed to clear it: see maxPendingResets.
 	pendingResets int
 
 	// readBeforeStreamID is the smallest stream ID that has not been followed by
@@ -582,6 +616,10 @@ type ClientConn struct {
 	werr error        // first write error that has occurred
 	hbuf bytes.Buffer // HPACK encoder writes into this
 	henc *hpack.Encoder
+
+	// prefacePingID is the next preface ping payload, big-endian, starting at
+	// 1. Chromium's next_ping_id_.
+	prefacePingID uint64
 }
 
 // clientStream is the state for a single HTTP/2 stream. One of these
@@ -1092,6 +1130,12 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	}
 
 	// Start the idle timer after the connection is fully initialized.
+	// Seed the read clock. The zero value reads as idle by decades, which
+	// would put a preface ping on the very first request of every fresh
+	// connection, a thing no browser does.
+	cc.lastReadNano.Store(time.Now().UnixNano())
+	cc.prefacePingID = 1
+
 	if d := t.idleConnTimeout(); d != 0 {
 		cc.idleTimeout = d
 		cc.idleTimer = time.AfterFunc(d, cc.onIdleTimeout)
@@ -1099,6 +1143,98 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 
 	go cc.readLoop()
 	return cc, nil
+}
+
+// maxPendingResets bounds the reset back-pressure counter.
+//
+// The counter used to be cleared by the ack to the PING that rode along with
+// every RST_STREAM. That PING is gone, and so is the 90-second health check
+// whose ack also cleared it, so the only thing left is a frame arriving from
+// the peer. A peer that acks nothing and sends nothing would otherwise hold
+// the connection at its concurrency limit for ever. Bounding it means the
+// worst case is reduced throughput on one connection rather than a wedge.
+const maxPendingResets = 32
+
+func (t *Transport) prefacePingIdle() time.Duration {
+	return t.PrefacePingIdle
+}
+
+func (t *Transport) prefacePingHang() time.Duration {
+	if t.PrefacePingHang > 0 {
+		return t.PrefacePingHang
+	}
+	return t.PrefacePingIdle
+}
+
+// maybeWritePrefacePingLocked writes a preface ping if the peer has been quiet
+// for longer than the configured idle threshold. cc.wmu must be held.
+//
+// This is Chromium's SpdySession::MaybeSendPrefacePing:
+//
+//	if (ping_in_flight_ || check_ping_status_pending_ ||
+//	    !enable_ping_based_connection_checking_) {
+//	  return;
+//	}
+//	if (time_func_() > last_read_time_ + connection_at_risk_of_loss_time_)
+//	  WritePingFrame(next_ping_id_, false);
+//
+// with the payload being a counter from 1 rather than random bytes. now is
+// passed in rather than read here so the caller can take it before a write
+// that might block: a slow write must not be able to manufacture idleness.
+func (cc *ClientConn) maybeWritePrefacePingLocked(now time.Time) {
+	idle := cc.t.prefacePingIdle()
+	if idle <= 0 {
+		return
+	}
+	if cc.prefacePingInFlight.Load() {
+		return
+	}
+	last := cc.lastReadNano.Load()
+	if last == 0 || !now.After(time.Unix(0, last).Add(idle)) {
+		return
+	}
+
+	var payload [8]byte
+	binary.BigEndian.PutUint64(payload[:], cc.prefacePingID)
+	if err := cc.fr.WritePing(false, payload); err != nil {
+		return
+	}
+	if err := cc.bw.Flush(); err != nil {
+		return
+	}
+	cc.prefacePingID++
+	cc.prefacePingInFlight.Store(true)
+	cc.armHangTimer(cc.t.prefacePingHang(), now)
+}
+
+// armHangTimer schedules the check that closes a connection whose peer has
+// gone silent while a preface ping is outstanding.
+func (cc *ClientConn) armHangTimer(hang time.Duration, lastCheck time.Time) {
+	if hang <= 0 {
+		return
+	}
+	t := time.AfterFunc(hang, func() { cc.checkPingStatus(hang, lastCheck) })
+	if old := cc.hangTimer.Swap(t); old != nil {
+		old.Stop()
+	}
+}
+
+// checkPingStatus is Chromium's SpdySession::CheckPingStatus. A peer that has
+// said nothing at all since the previous check, or nothing within the hang
+// interval, is treated as gone.
+func (cc *ClientConn) checkPingStatus(hang time.Duration, lastCheck time.Time) {
+	if !cc.prefacePingInFlight.Load() {
+		return
+	}
+	now := time.Now()
+	last := time.Unix(0, cc.lastReadNano.Load())
+	if now.After(last.Add(hang)) || last.Before(lastCheck) {
+		cc.vlogf("http2: Transport closing connection after an unanswered preface ping")
+		cc.closeForLostPing()
+		return
+	}
+	// The peer is talking, just not about our ping. Look again later.
+	cc.armHangTimer(last.Add(hang).Sub(now), now)
 }
 
 func (cc *ClientConn) healthCheck() {
@@ -1850,8 +1986,22 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// Write the request.
 	endStream := !res.HasBody && !res.HasTrailers
 	cs.sentHeaders = true
+
+	// Take the instant BEFORE the write. writeHeaders can block for a long
+	// time on a full send buffer, and deciding afterwards would let a slow
+	// write manufacture the idleness that triggers the ping.
+	pingNow := time.Now()
 	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, priority)
 	traceWroteHeaders(cs.trace)
+
+	// HEADERS first, then the PING, and the order is not arbitrary. Chromium
+	// calls MaybeSendPrefacePing from inside CreateHeaders, which runs when
+	// the HEADERS producer has already been dequeued by the write loop, so the
+	// HEADERS frame goes out immediately and the ping it enqueued follows.
+	// Reversing this would build a new tell in place of the one being closed.
+	if err == nil {
+		cc.maybeWritePrefacePingLocked(pingNow)
+	}
 	return err
 }
 
@@ -1942,7 +2092,7 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 		if cs.sentHeaders {
 			if se, ok := err.(StreamError); ok {
 				if se.Cause != errFromPeer {
-					cc.writeStreamReset(cs.ID, se.Code, false, err)
+					cc.writeStreamReset(cs.ID, se.Code, err)
 				}
 			} else {
 				// We're cancelling an in-flight request.
@@ -1953,35 +2103,29 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 				// sending this request, we let it continue to consume
 				// a concurrency slot until we can confirm the server is
 				// still responding.
-				// We do this by sending a PING frame along with the RST_STREAM
-				// (unless a ping is already in flight).
-				//
-				// For simplicity, we don't bother tracking the PING payload:
-				// We reset cc.pendingResets any time we receive a PING ACK.
+				// The counter is cleared by the next frame of any kind from
+				// the peer. It used to be cleared by the ack to a PING we
+				// bundled with the RST_STREAM, but no browser sends that PING
+				// and it drew a random 8-byte payload, which a single sample
+				// is enough to tell apart from a counter.
 				//
 				// We skip this if the conn is going to be closed on idle,
 				// because it's short lived and will probably be closed before
-				// we get the ping response.
-				ping := false
+				// the peer says anything at all.
 				if !closeOnIdle && !readSinceStream {
 					cc.mu.Lock()
-					// rstStreamPingsBlocked works around a gRPC behavior:
-					// see comment on the field for details.
-					if !cc.rstStreamPingsBlocked {
-						if cc.pendingResets == 0 {
-							ping = true
-						}
+					if cc.pendingResets < maxPendingResets {
 						cc.pendingResets++
 					}
 					cc.mu.Unlock()
 				}
-				cc.writeStreamReset(cs.ID, ErrCodeCancel, ping, err)
+				cc.writeStreamReset(cs.ID, ErrCodeCancel, err)
 			}
 		}
 		cs.bufPipe.CloseWithError(err) // no-op if already closed
 	} else {
 		if cs.sentHeaders && !cs.sentEndStream {
-			cc.writeStreamReset(cs.ID, ErrCodeNo, false, nil)
+			cc.writeStreamReset(cs.ID, ErrCodeNo, nil)
 		}
 		cs.bufPipe.CloseWithError(errRequestCanceled)
 	}
@@ -2208,6 +2352,15 @@ func (cs *clientStream) writeRequestBody(req *http.Request) (err error) {
 			data := remain[:allowed]
 			remain = remain[allowed:]
 			sentEnd = sawEOF && len(remain) == 0 && !hasTrailers
+			// PING first on this path, and again that is not arbitrary. On the
+			// body path Chromium calls MaybeSendPrefacePing from
+			// CreateDataBuffer, which runs BEFORE the DATA frame is enqueued,
+			// so the order genuinely inverts relative to the header path. The
+			// non-empty guard mirrors Chromium's own "Send PrefacePing for
+			// DATA_FRAMEs with nonzero payload size".
+			if len(data) > 0 {
+				cc.maybeWritePrefacePingLocked(time.Now())
+			}
 			err = cc.fr.WriteData(cs.ID, sentEnd, data)
 			if err == nil {
 				// TODO(bradfitz): this flush is for latency, not bandwidth.
@@ -2447,6 +2600,11 @@ func (rl *clientConnReadLoop) cleanup() {
 	if cc.idleTimer != nil {
 		cc.idleTimer.Stop()
 	}
+	// The hang timer's callback self-guards on the in-flight flag, so a missed
+	// stop degrades to a no-op rather than to a double close.
+	if t := cc.hangTimer.Swap(nil); t != nil {
+		t.Stop()
+	}
 
 	// Close any response bodies if the server closes prematurely.
 	// TODO: also do this if we've written the headers but not
@@ -2542,6 +2700,11 @@ func (rl *clientConnReadLoop) run() error {
 	}
 	for {
 		f, err := cc.fr.ReadFrame()
+		// Outside the timer branch on purpose. readIdleTimeout is zero for
+		// every profile that does not want the health check, so a stamp inside
+		// that branch would freeze at connection setup and every pooled
+		// connection would look idle by decades.
+		cc.lastReadNano.Store(time.Now().UnixNano())
 		if t != nil {
 			t.Reset(readIdleTimeout)
 		}
@@ -3118,10 +3281,15 @@ const (
 func (rl *clientConnReadLoop) streamByID(id uint32, headerOrData bool) *clientStream {
 	rl.cc.mu.Lock()
 	defer rl.cc.mu.Unlock()
-	if headerOrData {
-		// Work around an unfortunate gRPC behavior.
-		// See comment on ClientConn.rstStreamPingsBlocked for details.
-		rl.cc.rstStreamPingsBlocked = false
+	// A frame from the peer is proof that it is still answering, which is the
+	// only thing the reset back-pressure counter was ever asking about. This
+	// used to hang off the ack to a PING we bundled with each RST_STREAM; that
+	// PING is gone, and a frame of any kind is both broader evidence and free.
+	// Outside the headerOrData branch deliberately: a WINDOW_UPDATE or an
+	// RST_STREAM proves liveness every bit as well as a HEADERS does.
+	if rl.cc.pendingResets > 0 {
+		rl.cc.pendingResets = 0
+		rl.cc.cond.Broadcast()
 	}
 	rl.cc.readBeforeStreamID = rl.cc.nextStreamID
 	cs := rl.cc.streams[id]
@@ -3339,6 +3507,13 @@ func (cc *ClientConn) Ping(ctx context.Context) error {
 			return
 		}
 	}()
+	// Whatever happens, stop holding the map entry. Every non-success branch
+	// below used to leave it behind for the life of the connection.
+	defer func() {
+		cc.mu.Lock()
+		delete(cc.pings, p)
+		cc.mu.Unlock()
+	}()
 	select {
 	case <-c:
 		return nil
@@ -3355,6 +3530,13 @@ func (cc *ClientConn) Ping(ctx context.Context) error {
 func (rl *clientConnReadLoop) processPing(f *PingFrame) error {
 	if f.IsAck() {
 		cc := rl.cc
+		// Any ack answers whatever preface ping was outstanding. The payload
+		// is not consulted: there is at most one in flight, exactly as in
+		// Chromium, so there is nothing to disambiguate.
+		cc.prefacePingInFlight.Store(false)
+		if t := cc.hangTimer.Swap(nil); t != nil {
+			t.Stop()
+		}
 		defer cc.maybeCallStateHook()
 		cc.mu.Lock()
 		defer cc.mu.Unlock()
@@ -3362,12 +3544,6 @@ func (rl *clientConnReadLoop) processPing(f *PingFrame) error {
 		if c, ok := cc.pings[f.Data]; ok {
 			close(c)
 			delete(cc.pings, f.Data)
-		}
-		if cc.pendingResets > 0 {
-			// See clientStream.cleanupWriteRequest.
-			cc.pendingResets = 0
-			cc.rstStreamPingsBlocked = true
-			cc.cond.Broadcast()
 		}
 		return nil
 	}
@@ -3392,19 +3568,17 @@ func (rl *clientConnReadLoop) processPushPromise(f *PushPromiseFrame) error {
 }
 
 // writeStreamReset sends a RST_STREAM frame.
-// When ping is true, it also sends a PING frame with a random payload.
-func (cc *ClientConn) writeStreamReset(streamID uint32, code ErrCode, ping bool, err error) {
+//
+// It used to optionally bundle a PING with a random 8-byte payload. The ping
+// parameter is gone rather than always passed false, so that the compiler
+// forces a look at every call site if anyone tries to put it back.
+func (cc *ClientConn) writeStreamReset(streamID uint32, code ErrCode, err error) {
 	// TODO: map err to more interesting error codes, once the
 	// HTTP community comes up with some. But currently for
 	// RST_STREAM there's no equivalent to GOAWAY frame's debug
 	// data, and the error codes are all pretty vague ("cancel").
 	cc.wmu.Lock()
 	cc.fr.WriteRSTStream(streamID, code)
-	if ping {
-		var payload [8]byte
-		rand.Read(payload[:])
-		cc.fr.WritePing(false, payload)
-	}
 	cc.bw.Flush()
 	cc.wmu.Unlock()
 }
