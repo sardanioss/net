@@ -924,6 +924,20 @@ func shouldRetryRequest(req *http.Request, err error) (*http.Request, error) {
 	return nil, fmt.Errorf("http2: Transport: cannot retry err [%v] after Request.Body was written; define Request.GetBody to avoid this error", err)
 }
 
+// ShouldRetryRequest reports whether a request that failed before its response
+// headers arrived may be replayed, and returns the request to replay: either
+// the original, or a clone with its body rewound from GetBody.
+//
+// It is exported because a consumer that drives ClientConn.RoundTrip directly,
+// rather than going through Transport.RoundTripOpt, otherwise has no access to
+// this classification and ends up either replaying errors a browser gives up
+// on or replaying a body it has already drained. Both are visible from the
+// server side: the second sends content-length N with no DATA behind it, which
+// is malformed under RFC 9113 8.1.1.
+func ShouldRetryRequest(req *http.Request, err error) (*http.Request, error) {
+	return shouldRetryRequest(req, err)
+}
+
 func canRetryError(err error) bool {
 	if err == errClientConnUnusable || err == errClientConnGotGoAway {
 		return true
