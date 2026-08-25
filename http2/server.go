@@ -482,7 +482,7 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 	// configured value for inflow, that will be updated when we send a
 	// WINDOW_UPDATE shortly after sending SETTINGS.
 	sc.flow.add(initialWindowSize)
-	sc.inflow.init(initialWindowSize)
+	sc.inflow.init(initialWindowSize, time.Now())
 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
 	sc.hpackEncoder.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
 
@@ -2206,7 +2206,7 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState) *stream 
 	st.cw.Init()
 	st.flow.conn = &sc.flow // link to conn-level counter
 	st.flow.add(sc.initialStreamSendWindowSize)
-	st.inflow.init(sc.initialStreamRecvWindowSize)
+	st.inflow.init(sc.initialStreamRecvWindowSize, time.Now())
 	if sc.hs.WriteTimeout > 0 {
 		st.writeDeadline = time.AfterFunc(sc.hs.WriteTimeout, st.onWriteTimeout)
 	}
@@ -2544,11 +2544,12 @@ func (sc *serverConn) sendWindowUpdate(st *stream, n int) {
 	sc.serveG.check()
 	var streamID uint32
 	var send int32
+	now := time.Now()
 	if st == nil {
-		send = sc.inflow.add(n)
+		send = sc.inflow.add(n, now)
 	} else {
 		streamID = st.id
-		send = st.inflow.add(n)
+		send = st.inflow.add(n, now)
 	}
 	if send == 0 {
 		return

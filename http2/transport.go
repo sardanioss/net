@@ -1084,7 +1084,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		cc.fr.WritePriority(priority.StreamID, priority.PriorityParam)
 	}
 
-	cc.inflow.init(conf.MaxUploadBufferPerConnection + initialWindowSize)
+	cc.inflow.init(conf.MaxUploadBufferPerConnection+initialWindowSize, time.Now())
 	cc.bw.Flush()
 	if cc.werr != nil {
 		cc.Close()
@@ -2363,7 +2363,7 @@ type resAndError struct {
 func (cc *ClientConn) addStreamLocked(cs *clientStream) {
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.init(cc.initialStreamRecvWindowSize)
+	cs.inflow.init(cc.initialStreamRecvWindowSize, time.Now())
 	cs.ID = cc.nextStreamID
 	cc.nextStreamID += 2
 	cc.streams[cs.ID] = cs
@@ -2881,11 +2881,35 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 		return
 	}
 
+	// Read the clock once per event, outside the lock.
+	now := time.Now()
+
 	cc.mu.Lock()
-	connAdd := cc.inflow.add(n)
+	connAdd := cc.inflow.add(n, now)
 	var streamAdd int32
-	if err == nil { // No need to refresh if the stream is over or failed.
-		streamAdd = cs.inflow.add(n)
+	// No need to refresh if the stream is over or failed, and none at all once
+	// the peer has closed its half: Chromium's stream-scope update opens with
+	// an is-the-stream-still-active check and returns early, which is why a
+	// browser never emits a stream WINDOW_UPDATE for a stream it has already
+	// seen END_STREAM on. The connection-scope update must keep flowing, since
+	// the peer has still spent that much of its send window.
+	//
+	// peerClosed rather than cs.readClosed: readClosed is assigned one line
+	// before the read loop takes cc.mu, so reading it here would be a race,
+	// while peerClosed is closed with cc.mu held.
+	//
+	// This suppresses marginally more than Chromium does, which deactivates a
+	// stream only once both directions are closed. Keying on the read
+	// direction alone costs nothing: the peer will never send more DATA on
+	// that stream, so the credit it would return can never be spent.
+	peerDone := false
+	select {
+	case <-cs.peerClosed:
+		peerDone = true
+	default:
+	}
+	if err == nil && !peerDone {
+		streamAdd = cs.inflow.add(n, now)
 	}
 	cc.mu.Unlock()
 
@@ -2914,9 +2938,10 @@ func (b transportResponseBody) Close() error {
 
 	unread := cs.bufPipe.Len()
 	if unread > 0 {
+		now := time.Now()
 		cc.mu.Lock()
 		// Return connection-level flow control.
-		connAdd := cc.inflow.add(unread)
+		connAdd := cc.inflow.add(unread, now)
 		cc.mu.Unlock()
 
 		// TODO(dneil): Acquiring this mutex can block indefinitely.
@@ -2963,9 +2988,10 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 
 		// But at least return their flow control:
 		if f.Length > 0 {
+			now := time.Now()
 			cc.mu.Lock()
 			ok := cc.inflow.take(f.Length)
-			connAdd := cc.inflow.add(int(f.Length))
+			connAdd := cc.inflow.add(int(f.Length), now)
 			cc.mu.Unlock()
 			if !ok {
 				return ConnectionError(ErrCodeFlowControl)
@@ -3028,10 +3054,11 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 			}
 		}
 
-		sendConn := cc.inflow.add(refund)
+		refundNow := time.Now()
+		sendConn := cc.inflow.add(refund, refundNow)
 		var sendStream int32
 		if !didReset {
-			sendStream = cs.inflow.add(refund)
+			sendStream = cs.inflow.add(refund, refundNow)
 		}
 		cc.mu.Unlock()
 
