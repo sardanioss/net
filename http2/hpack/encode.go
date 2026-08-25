@@ -41,6 +41,14 @@ type Encoder struct {
 	// supports. This will protect the encoder from too large
 	// size.
 	maxSizeLimit uint32
+	// settingsSizeBound is the last SETTINGS_HEADER_TABLE_SIZE the peer
+	// advertised, before any clamping. It records what the peer SAID, which is
+	// not the same as what we chose to honour: comparing against the table
+	// size instead looks equivalent and is, right up until the limit is
+	// clamping, at which point the table holds the clamped value while this
+	// holds the peer's. Get that wrong and a peer that advertises a clamped
+	// value twice gets one update from a browser and none from us.
+	settingsSizeBound uint32
 	// tableSizeUpdate indicates whether "Header Table Size
 	// Update" is required.
 	tableSizeUpdate bool
@@ -89,10 +97,11 @@ type Encoder struct {
 // encoded data is written to w.
 func NewEncoder(w io.Writer) *Encoder {
 	e := &Encoder{
-		minSize:         uint32Max,
-		maxSizeLimit:    initialHeaderTableSize,
-		tableSizeUpdate: false,
-		w:               w,
+		minSize:           uint32Max,
+		maxSizeLimit:      initialHeaderTableSize,
+		settingsSizeBound: initialHeaderTableSize,
+		tableSizeUpdate:   false,
+		w:                 w,
 	}
 	e.dynTab.table.init()
 	e.dynTab.setMaxSize(initialHeaderTableSize)
@@ -203,13 +212,44 @@ func (e *Encoder) searchTable(f HeaderField) (i uint64, nameValueMatch bool) {
 // The actual size is bounded by the value passed to
 // SetMaxDynamicTableSizeLimit.
 func (e *Encoder) SetMaxDynamicTableSize(v uint32) {
+	// quiche's HpackEncoder::ApplyHeaderTableSizeSetting, step for step:
+	//
+	//	if (size_setting == header_table_.settings_size_bound() &&
+	//	    size_setting <= table_size_upper_bound_) {
+	//	  return;
+	//	}
+	//	if (size_setting < header_table_.settings_size_bound()) {
+	//	  min_table_size_setting_received_ =
+	//	      std::min(size_setting, min_table_size_setting_received_);
+	//	}
+	//	header_table_.SetSettingsHeaderTableSize(size_setting);
+	//	if (size_setting > table_size_upper_bound_) {
+	//	  header_table_.SetMaxSize(table_size_upper_bound_);
+	//	}
+	//	should_emit_table_size_ = true;
+
+	// Nothing changed and nothing is being clamped, so there is nothing to
+	// tell the peer. Both halves of the condition matter: the second is what
+	// leaves a repeat of a clamped value still able to re-arm.
+	if v == e.settingsSizeBound && v <= e.maxSizeLimit {
+		return
+	}
+
+	// The minimum is lowered against the BOUND, not against the running
+	// minimum. Guarding on the running minimum makes two SETTINGS frames
+	// carrying increasing values, both above the current bound, emit two
+	// updates where a browser emits one.
+	if v < e.settingsSizeBound && v < e.minSize {
+		e.minSize = v
+	}
+
+	// Before any clamping: this records the peer's value.
+	e.settingsSizeBound = v
+
+	e.tableSizeUpdate = true
 	if v > e.maxSizeLimit {
 		v = e.maxSizeLimit
 	}
-	if v < e.minSize {
-		e.minSize = v
-	}
-	e.tableSizeUpdate = true
 	e.dynTab.setMaxSize(v)
 }
 
@@ -227,9 +267,17 @@ func (e *Encoder) MaxDynamicTableSize() (v uint32) {
 // maximum dynamic header table size is truncated to v.
 func (e *Encoder) SetMaxDynamicTableSizeLimit(v uint32) {
 	e.maxSizeLimit = v
-	if e.dynTab.maxSize > v {
+	// Recompute the target rather than only shrinking. Raising the limit past
+	// a bound that was previously being clamped has to move the table up as
+	// well, or the encoder keeps using a smaller table than it has told the
+	// peer about.
+	target := e.settingsSizeBound
+	if target > v {
+		target = v
+	}
+	if e.dynTab.maxSize != target {
 		e.tableSizeUpdate = true
-		e.dynTab.setMaxSize(v)
+		e.dynTab.setMaxSize(target)
 	}
 }
 

@@ -323,9 +323,13 @@ func TestEncoderSetMaxDynamicTableSizeLimit(t *testing.T) {
 	if got, want := e.dynTab.maxSize, uint32(4095); got != want {
 		t.Errorf("e.dynTab.maxSize = %v; want %v", got, want)
 	}
-	// 8192 > current maxSizeLimit, so maxSize does not change.
+	// Raising the limit reopens the table up to what the peer allowed, which
+	// is 16384 here, so the new limit of 8192 is what binds. Go's version left
+	// maxSize at 4095, which keeps the encoder using a smaller table than it
+	// has told the peer about; quiche recomputes the target as
+	// min(setting, upper_bound) every time it emits.
 	e.SetMaxDynamicTableSizeLimit(8192)
-	if got, want := e.dynTab.maxSize, uint32(4095); got != want {
+	if got, want := e.dynTab.maxSize, uint32(8192); got != want {
 		t.Errorf("e.dynTab.maxSize = %v; want %v", got, want)
 	}
 	if got, want := e.maxSizeLimit, uint32(8192); got != want {

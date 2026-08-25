@@ -5,8 +5,8 @@
 package http2
 
 import (
-	"math"
 	http "github.com/sardanioss/http"
+	"math"
 	"time"
 )
 
@@ -92,15 +92,28 @@ func configFromTransport(h2 *Transport) http2Config {
 		}
 	}
 
-	// Auto-derive HPACK table sizes from custom SETTINGS_HEADER_TABLE_SIZE.
-	// The advertised value controls both our decoder capacity and our encoder
-	// limit. Without this, both default to 4096 even when the preset advertises
-	// 65536, causing COMPRESSION_ERROR when servers use the larger table, and
-	// different HPACK dynamic table behavior than Chrome.
+	// Auto-derive the DECODER capacity from custom SETTINGS_HEADER_TABLE_SIZE.
+	// Without this it defaults to 4096 even when the profile advertises 65536,
+	// which is a COMPRESSION_ERROR the moment a server uses the larger table.
+	//
+	// The ENCODER limit is deliberately NOT derived here, and that used to be
+	// the line below this one. SETTINGS_HEADER_TABLE_SIZE is what we tell the
+	// peer our DECODER can hold; the encoder limit is how big a table we are
+	// willing to maintain for ENCODING. Different directions of the same
+	// connection, no reason to share a value. Feeding one into the other made
+	// the encoder's ceiling equal to our own advertised size, so a peer
+	// advertising anything larger got a table size update carrying our number
+	// instead of theirs, which is a discrepancy the peer chooses and can
+	// therefore probe for. quiche sets its encoder bound to the maximum
+	// representable value and never changes it, so the peer's value flows
+	// through untouched.
+	//
+	// This assignment also ran AFTER the struct literal in the consumer, so
+	// patching the consumer alone looked applied, passed its tests, and
+	// changed nothing on the wire.
 	if hts, ok := h2.Settings[SettingHeaderTableSize]; ok && hts > 0 {
 		if hts <= 1<<30 { // cap at 1GB
 			conf.MaxDecoderHeaderTableSize = hts
-			conf.MaxEncoderHeaderTableSize = hts
 		}
 	}
 
