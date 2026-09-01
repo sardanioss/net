@@ -355,13 +355,40 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 	return res, nil
 }
 
+// hasHeaderFold reports whether the map holds the named header under any
+// spelling of its key.
+//
+// http.Header.Get canonicalises before looking up, so a map built through
+// Header.Set can be indexed directly. A map built by assigning to it cannot:
+// header["accept-encoding"] and header["Accept-Encoding"] are different keys.
+// That distinction matters here because a caller reproducing a captured request
+// stores header names exactly as the wire carried them, and on HTTP/2 the wire
+// carries them lowercased.
+func hasHeaderFold(header map[string][]string, name string) bool {
+	if len(header[name]) > 0 {
+		return true
+	}
+	for k, v := range header {
+		if len(v) > 0 && asciiEqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsRequestGzip reports whether we should add an Accept-Encoding: gzip header
 // for a request.
 func IsRequestGzip(method string, header map[string][]string, disableCompression bool) bool {
 	// TODO(bradfitz): this is a copy of the logic in net/http. Unify somewhere?
+	//
+	// The two lookups fold case. Indexing the map directly missed a header the
+	// caller had set under a non-canonical key, so a request already carrying
+	// accept-encoding got a second one appended and went out with the header
+	// twice, which no browser does. Same for Range, where the duplicate also
+	// defeats the reason gzip is skipped for ranged requests.
 	if !disableCompression &&
-		len(header["Accept-Encoding"]) == 0 &&
-		len(header["Range"]) == 0 &&
+		!hasHeaderFold(header, "Accept-Encoding") &&
+		!hasHeaderFold(header, "Range") &&
 		method != "HEAD" {
 		// Request gzip only, not deflate. Deflate is ambiguous and
 		// not as universally supported anyway.
