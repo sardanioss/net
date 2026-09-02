@@ -267,25 +267,40 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 
 		// Process headers in specified order if HeaderOrder is provided
 		if len(param.HeaderOrder) > 0 {
+			// A name may hold more than one slot in the order list, which is
+			// how a caller asks for two fields of one name in chosen positions
+			// relative to other names: cookie, accept, cookie has to keep the
+			// accept in the middle. Count the slots per resolved map key first,
+			// then hand slot i the value at index i.
+			slots := make(map[string]int, len(param.HeaderOrder))
+			for _, k := range param.HeaderOrder {
+				if hk, ok := resolveHeaderKey(req.Header, k); ok {
+					slots[hk]++
+				}
+			}
+			cursor := make(map[string]int, len(slots))
+
 			// First, process headers in the specified order
 			processedHeaders := make(map[string]bool)
 			for _, k := range param.HeaderOrder {
 				// Special case: content-length is not in req.Header but we handle it
 				if asciiEqualFold(k, "content-length") {
-					if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+					if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
 						f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
 						didContentLength = true
 					}
 					continue
 				}
-				// Find the header (case-insensitive match)
-				for hk, vv := range req.Header {
-					if asciiEqualFold(hk, k) && !processedHeaders[hk] {
-						processHeader(hk, vv)
-						processedHeaders[hk] = true
-						break
-					}
+				hk, ok := resolveHeaderKey(req.Header, k)
+				if !ok {
+					continue
 				}
+				i := cursor[hk]
+				cursor[hk]++
+				if vv := valuesForSlot(req.Header[hk], slots[hk], i); len(vv) > 0 {
+					processHeader(hk, vv)
+				}
+				processedHeaders[hk] = true
 			}
 			// Then process any remaining headers not in the order list
 			for k, vv := range req.Header {
@@ -587,4 +602,49 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 		RequestURI:    requestURI,
 		Trailer:       trailer,
 	}
+}
+
+// resolveHeaderKey returns the key under which h actually stores the header
+// named by key.
+//
+// The exact key wins over a fold match, which matters only when a caller lists
+// one name in two casings: "Cookie" and "cookie" are two map entries, and a
+// plain fold scan over a randomised map iteration would point both order slots
+// at whichever one it happened to reach first. With more than one fold
+// candidate and no exact hit, take the lowest, so the wire order does not
+// change from request to request.
+func resolveHeaderKey(h map[string][]string, key string) (string, bool) {
+	if _, ok := h[key]; ok {
+		return key, true
+	}
+	best := ""
+	found := false
+	for hk := range h {
+		if asciiEqualFold(hk, key) && (!found || hk < best) {
+			best, found = hk, true
+		}
+	}
+	return best, found
+}
+
+// valuesForSlot returns the values one order slot emits.
+//
+// n is how many slots the order list gives this header name and i is which of
+// them this is, counting from zero.
+//
+// One slot takes every value, which is the long-standing behaviour and the
+// only shape an ordinary caller produces. Several slots split the values one
+// apiece in order, and the last slot takes whatever is left, so listing a name
+// twice against three values does not drop the third.
+func valuesForSlot(vals []string, n, i int) []string {
+	if n <= 1 {
+		return vals
+	}
+	if i >= len(vals) {
+		return nil
+	}
+	if i == n-1 {
+		return vals[i:]
+	}
+	return vals[i : i+1]
 }

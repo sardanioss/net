@@ -68,6 +68,14 @@ const (
 	// defines the order in which regular headers should be sent.
 	// The value is a slice of lowercase header names.
 	// Example: req.Header[HeaderOrderKey] = []string{"accept", "user-agent", "accept-language"}
+	//
+	// A name may appear more than once, which is how a caller places two fields
+	// of one name relative to other names. Each occurrence is a slot, and slot i
+	// takes the value at index i of that name's slice, with the last slot taking
+	// whatever is left. A name listed once still emits all of its values, so an
+	// ordinary deduplicated order list behaves exactly as it always has.
+	// Example: []string{"cookie", "accept", "cookie"} against
+	// Header["cookie"] = []string{"a=1", "b=2"} puts the accept between them.
 	HeaderOrderKey = "Header-Order:"
 
 	// PHeaderOrderKey is a magic key for Request.Header that, if present,
