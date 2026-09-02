@@ -552,14 +552,21 @@ type ClientConn struct {
 	idleTimeout time.Duration // or 0 for never
 	idleTimer   *time.Timer
 
-	mu               sync.Mutex // guards following
-	cond             *sync.Cond // hold mu; broadcast on flow/closed changes
-	flow             outflow    // our conn-level flow control quota (cs.outflow is per stream)
-	inflow           inflow     // peer's conn-level flow control
-	doNotReuse       bool       // whether conn is marked to not be reused for any future requests
-	closing          bool
-	closed           bool
-	closedOnIdle     bool                     // true if conn was closed for idleness
+	mu           sync.Mutex // guards following
+	cond         *sync.Cond // hold mu; broadcast on flow/closed changes
+	flow         outflow    // our conn-level flow control quota (cs.outflow is per stream)
+	inflow       inflow     // peer's conn-level flow control
+	doNotReuse   bool       // whether conn is marked to not be reused for any future requests
+	closing      bool
+	closed       bool
+	closedOnIdle bool // true if conn was closed for idleness
+	// closedExplicitly is true when the caller closed this connection through
+	// the exported Close, rather than it failing or timing out on its own. It
+	// suppresses the five second park in the read loop's cleanup: that park is
+	// there so a fresh connection that fails by itself stays in the pool long
+	// enough to report its error, which is not the situation when the caller
+	// asked for the connection to go away.
+	closedExplicitly bool
 	seenSettings     bool                     // true if we've seen a settings frame, false otherwise
 	seenSettingsChan chan struct{}            // closed when seenSettings is true or frame reading fails
 	wantSettingsAck  bool                     // we sent a SETTINGS frame and haven't heard back
@@ -1651,6 +1658,9 @@ func (cc *ClientConn) closeForError(err error) {
 //
 // In-flight requests are interrupted. For a graceful shutdown, use Shutdown instead.
 func (cc *ClientConn) Close() error {
+	cc.mu.Lock()
+	cc.closedExplicitly = true
+	cc.mu.Unlock()
 	cc.closeForError(errClientConnForceClosed)
 	return nil
 }
@@ -2673,7 +2683,7 @@ func (rl *clientConnReadLoop) cleanup() {
 		unusedWaitTime = cc.idleTimeout
 	}
 	idleTime := time.Now().Sub(cc.lastActive)
-	if atomic.LoadUint32(&cc.atomicReused) == 0 && idleTime < unusedWaitTime && !cc.closedOnIdle {
+	if atomic.LoadUint32(&cc.atomicReused) == 0 && idleTime < unusedWaitTime && !cc.closedOnIdle && !cc.closedExplicitly {
 		cc.idleTimer = time.AfterFunc(unusedWaitTime-idleTime, func() {
 			cc.t.connPool().MarkDead(cc)
 		})
