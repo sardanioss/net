@@ -143,6 +143,17 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		return res, err
 	}
 
+	// A non-empty order list is resolved before enumeration because
+	// enumerateHeaders can run twice per request, once counting bytes against
+	// the peer's header list size and once encoding, and resolution is the
+	// expensive half: every order entry has to find the key req.Header
+	// actually stores its header under, whatever the casing. Both passes
+	// replay the resolved plan.
+	var orderPlan []plannedHeader
+	if len(param.HeaderOrder) > 0 {
+		orderPlan = planHeaderOrder(param.HeaderOrder, req.Header)
+	}
+
 	enumerateHeaders := func(f func(name, value string)) {
 		// 8.1.2.3 Request Pseudo-Header Fields
 		// The :path pseudo-header field includes the path and query parts of the
@@ -265,48 +276,17 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			}
 		}
 
-		// Process headers in specified order if HeaderOrder is provided
-		if len(param.HeaderOrder) > 0 {
-			// A name may hold more than one slot in the order list, which is
-			// how a caller asks for two fields of one name in chosen positions
-			// relative to other names: cookie, accept, cookie has to keep the
-			// accept in the middle. Count the slots per resolved map key first,
-			// then hand slot i the value at index i.
-			slots := make(map[string]int, len(param.HeaderOrder))
-			for _, k := range param.HeaderOrder {
-				if hk, ok := resolveHeaderKey(req.Header, k); ok {
-					slots[hk]++
-				}
-			}
-			cursor := make(map[string]int, len(slots))
-
-			// First, process headers in the specified order
-			processedHeaders := make(map[string]bool)
-			for _, k := range param.HeaderOrder {
-				// Special case: content-length is not in req.Header but we handle it
-				if asciiEqualFold(k, "content-length") {
+		// Emit the ordered headers if HeaderOrder is provided
+		if orderPlan != nil {
+			for _, ph := range orderPlan {
+				if ph.contentLength {
 					if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
 						f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
 						didContentLength = true
 					}
 					continue
 				}
-				hk, ok := resolveHeaderKey(req.Header, k)
-				if !ok {
-					continue
-				}
-				i := cursor[hk]
-				cursor[hk]++
-				if vv := valuesForSlot(req.Header[hk], slots[hk], i); len(vv) > 0 {
-					processHeader(hk, vv)
-				}
-				processedHeaders[hk] = true
-			}
-			// Then process any remaining headers not in the order list
-			for k, vv := range req.Header {
-				if !processedHeaders[k] {
-					processHeader(k, vv)
-				}
+				processHeader(ph.key, ph.values)
 			}
 		} else {
 			// No order specified, use sorted order for consistency
@@ -604,27 +584,107 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 	}
 }
 
-// resolveHeaderKey returns the key under which h actually stores the header
-// named by key.
-//
-// The exact key wins over a fold match, which matters only when a caller lists
-// one name in two casings: "Cookie" and "cookie" are two map entries, and a
-// plain fold scan over a randomised map iteration would point both order slots
-// at whichever one it happened to reach first. With more than one fold
-// candidate and no exact hit, take the lowest, so the wire order does not
-// change from request to request.
-func resolveHeaderKey(h map[string][]string, key string) (string, bool) {
-	if _, ok := h[key]; ok {
-		return key, true
+// foldKey returns the ASCII-lowered form of a header name, the canonical
+// representative of its fold class: foldKey(a) == foldKey(b) exactly when
+// asciiEqualFold(a, b), for any byte strings, because both touch only 'A'-'Z'.
+// A well-known canonical name resolves through the interned table and an
+// already-lowercase name is returned as is, so neither allocates.
+func foldKey(s string) string {
+	buildCommonHeaderMapsOnce()
+	if l, ok := commonLowerHeader[s]; ok {
+		return l
 	}
-	best := ""
-	found := false
-	for hk := range h {
-		if asciiEqualFold(hk, key) && (!found || hk < best) {
-			best, found = hk, true
+	for i := 0; i < len(s); i++ {
+		if 'A' <= s[i] && s[i] <= 'Z' {
+			b := []byte(s)
+			for ; i < len(b); i++ {
+				b[i] = lower(b[i])
+			}
+			return string(b)
 		}
 	}
-	return best, found
+	return s
+}
+
+// plannedHeader is one emission the order plan produced: a resolved header
+// with the values its slot takes, or the slot at which content-length goes
+// out. Content-length is not in req.Header and its value is resolved at
+// emission time, so the plan only records its position.
+type plannedHeader struct {
+	key           string
+	values        []string
+	contentLength bool
+}
+
+// planHeaderOrder resolves a header order list against h once, into the exact
+// sequence of emissions the old per-pass resolution produced.
+//
+// Resolution finds the key h actually stores each ordered name under. The
+// exact key wins over a fold match, which matters only when a caller lists
+// one name in two casings: "Cookie" and "cookie" are two map entries, and a
+// fold match over a randomised map iteration would point both order slots
+// at whichever one it happened to reach first. With more than one fold
+// candidate and no exact hit, take the lowest, so the wire order does not
+// change from request to request. The index below holds the lowest key per
+// fold class, built in one pass over h, so each entry resolves in one lookup
+// instead of a scan over the map.
+//
+// A name may hold more than one slot in the order list, which is how a caller
+// asks for two fields of one name in chosen positions relative to other
+// names: cookie, accept, cookie has to keep the accept in the middle. Count
+// the slots per resolved key first, then hand slot i the value at index i.
+// Headers h holds that the order list never named follow in map order; which
+// order that is varies per request but not between the two enumeration
+// passes, which replay one plan.
+func planHeaderOrder(order []string, h map[string][]string) []plannedHeader {
+	index := make(map[string]string, len(h))
+	for hk := range h {
+		fk := foldKey(hk)
+		if best, ok := index[fk]; !ok || hk < best {
+			index[fk] = hk
+		}
+	}
+	resolve := func(k string) (string, bool) {
+		if _, ok := h[k]; ok {
+			return k, true
+		}
+		hk, ok := index[foldKey(k)]
+		return hk, ok
+	}
+
+	slots := make(map[string]int, len(order))
+	for _, k := range order {
+		if hk, ok := resolve(k); ok {
+			slots[hk]++
+		}
+	}
+	// cursor doubles as the processed set: it gains a key exactly when an
+	// order slot resolved to it.
+	cursor := make(map[string]int, len(slots))
+
+	plan := make([]plannedHeader, 0, len(order))
+	for _, k := range order {
+		// Special case: content-length is not in req.Header but we handle it
+		if asciiEqualFold(k, "content-length") {
+			plan = append(plan, plannedHeader{contentLength: true})
+			continue
+		}
+		hk, ok := resolve(k)
+		if !ok {
+			continue
+		}
+		i := cursor[hk]
+		cursor[hk]++
+		if vv := valuesForSlot(h[hk], slots[hk], i); len(vv) > 0 {
+			plan = append(plan, plannedHeader{key: hk, values: vv})
+		}
+	}
+	for k, vv := range h {
+		if _, ok := cursor[k]; !ok {
+			plan = append(plan, plannedHeader{key: k, values: vv})
+		}
+	}
+	return plan
 }
 
 // valuesForSlot returns the values one order slot emits.
