@@ -185,6 +185,19 @@ type Transport struct {
 	// Chrome sends cookies as one entry; splitting is detectable by servers.
 	DisableCookieSplit bool
 
+	// WireCaseResponseHeaders, when true, keys a response's Header map by the
+	// field name exactly as the wire carried it instead of canonicalising it.
+	// HTTP/2 requires lowercase field names (RFC 9113 §8.2.1) and the framer
+	// rejects anything else, so the keys are the lowercase names, one string
+	// per field straight from HPACK with no per-name conversion or allocation.
+	//
+	// http.Header's accessors (Get, Values, Set, Del) canonicalise the name
+	// they are given and will not find these keys; a caller setting this reads
+	// and writes the map directly. Trailer maps keep canonical keys either
+	// way. Off by default, which preserves the canonical maps net/http
+	// callers expect.
+	WireCaseResponseHeaders bool
+
 	// UserAgent specifies the default User-Agent header to send when the request
 	// doesn't contain one. If empty, uses "Go-http-client/2.0".
 	// Set this to match the browser profile being fingerprinted.
@@ -2916,9 +2929,17 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		header[http.HeaderOrderKey] = order
 	}
 
+	// The wire name is the map key in wire-case mode; the framer has already
+	// rejected any field name that is not lowercase, so hf.Name needs no work.
+	// The trailer announcement is detected on the wire name so both modes take
+	// the same branch, and the Trailer map's keys stay canonical either way.
+	wireCase := cs.cc.t.WireCaseResponseHeaders
 	for _, hf := range regularFields {
-		key := httpcommon.CanonicalHeader(hf.Name)
-		if key == "Trailer" {
+		key := hf.Name
+		if !wireCase {
+			key = httpcommon.CanonicalHeader(hf.Name)
+		}
+		if asciiEqualFold(hf.Name, "trailer") {
 			t := res.Trailer
 			if t == nil {
 				t = make(http.Header)
@@ -2987,8 +3008,12 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		return nil, nil
 	}
 
+	clenKey, cencKey := "Content-Length", "Content-Encoding"
+	if wireCase {
+		clenKey, cencKey = "content-length", "content-encoding"
+	}
 	res.ContentLength = -1
-	if clens := res.Header["Content-Length"]; len(clens) == 1 {
+	if clens := res.Header[clenKey]; len(clens) == 1 {
 		if cl, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
 			res.ContentLength = int64(cl)
 		} else {
@@ -3020,12 +3045,18 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 	cs.bytesRemain = res.ContentLength
 	res.Body = transportResponseBody{cs}
 
-	if cs.requestedGzip && asciiEqualFold(res.Header.Get("Content-Encoding"), "gzip") {
-		res.Header.Del("Content-Encoding")
-		res.Header.Del("Content-Length")
-		res.ContentLength = -1
-		res.Body = &gzipReader{body: res.Body}
-		res.Uncompressed = true
+	if cs.requestedGzip {
+		var cenc string
+		if vv := res.Header[cencKey]; len(vv) > 0 {
+			cenc = vv[0]
+		}
+		if asciiEqualFold(cenc, "gzip") {
+			delete(res.Header, cencKey)
+			delete(res.Header, clenKey)
+			res.ContentLength = -1
+			res.Body = &gzipReader{body: res.Body}
+			res.Uncompressed = true
+		}
 	}
 	return res, nil
 }
