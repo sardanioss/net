@@ -154,58 +154,76 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		orderPlan = planHeaderOrder(param.HeaderOrder, req.Header)
 	}
 
-	enumerateHeaders := func(f func(name, value string)) {
-		// 8.1.2.3 Request Pseudo-Header Fields
-		// The :path pseudo-header field includes the path and query parts of the
-		// target URI (the path-absolute production and optionally a '?' character
-		// followed by the query production, see Sections 3.3 and 3.4 of
-		// [RFC3986]).
-		m := req.Method
-		if m == "" {
-			m = "GET"
-		}
+	// 8.1.2.3 Request Pseudo-Header Fields
+	// The :path pseudo-header field includes the path and query parts of the
+	// target URI (the path-absolute production and optionally a '?' character
+	// followed by the query production, see Sections 3.3 and 3.4 of
+	// [RFC3986]).
+	m := req.Method
+	if m == "" {
+		m = "GET"
+	}
 
-		// Build pseudo-header values map
-		pseudoHeaders := map[string]string{
-			":method":    m,
-			":authority": host,
-		}
-		if !isNormalConnect {
-			pseudoHeaders[":path"] = path
-			pseudoHeaders[":scheme"] = req.URL.Scheme
-		}
-		if protocol != "" {
-			pseudoHeaders[":protocol"] = protocol
-		}
-
-		// Send pseudo-headers in specified order (default: Chrome order)
-		pseudoOrder := param.PseudoHeaderOrder
-		if len(pseudoOrder) == 0 {
-			// Default to Chrome order: :method, :authority, :scheme, :path
-			if isNormalConnect {
-				pseudoOrder = []string{":method", ":authority"}
-			} else {
-				pseudoOrder = []string{":method", ":authority", ":scheme", ":path"}
+	// pseudoValue returns the value the request carries for a pseudo-header,
+	// replacing a map both enumeration passes used to rebuild. Names not
+	// matched here are skipped, exactly as a map miss was.
+	pseudoValue := func(name string) (string, bool) {
+		switch name {
+		case ":method":
+			return m, true
+		case ":authority":
+			return host, true
+		case ":path":
+			if !isNormalConnect {
+				return path, true
 			}
+		case ":scheme":
+			if !isNormalConnect {
+				return req.URL.Scheme, true
+			}
+		case ":protocol":
 			if protocol != "" {
-				pseudoOrder = append(pseudoOrder, ":protocol")
+				return protocol, true
 			}
 		}
+		return "", false
+	}
 
+	// Send pseudo-headers in specified order (default: Chrome order)
+	pseudoOrder := param.PseudoHeaderOrder
+	if len(pseudoOrder) == 0 {
+		// Default to Chrome order: :method, :authority, :scheme, :path
+		switch {
+		case isNormalConnect:
+			pseudoOrder = defaultPseudoOrderConnect
+		case protocol != "":
+			pseudoOrder = defaultPseudoOrderProtocol
+		default:
+			pseudoOrder = defaultPseudoOrder
+		}
+	}
+
+	// enumerateHeaders calls f for every field the request sends, in wire
+	// order. wireName is the ASCII-lowered name when the emission site already
+	// has it: literal names below are written lowercase and the order plan
+	// carries the lowered form of every key it resolved. An empty wireName
+	// means the caller must lower (and validate) the name itself, which only
+	// the unordered fallback path still needs.
+	enumerateHeaders := func(f func(name, wireName, value string)) {
 		for _, name := range pseudoOrder {
-			if val, ok := pseudoHeaders[name]; ok {
-				f(name, val)
+			if val, ok := pseudoValue(name); ok {
+				f(name, name, val)
 			}
 		}
 		if trailers != "" {
-			f("trailer", trailers)
+			f("trailer", "trailer", trailers)
 		}
 
 		var didUA bool
 		var didContentLength bool
 
 		// Helper to process a single header
-		processHeader := func(k string, vv []string) {
+		processHeader := func(k, wireName string, vv []string) {
 			// Skip magic ordering keys - they are only for controlling order
 			if k == "Header-Order:" || k == "PHeader-Order:" {
 				return
@@ -251,7 +269,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 							if p < 0 {
 								break
 							}
-							f("cookie", v[:p])
+							f("cookie", "cookie", v[:p])
 							p++
 							// strip space after semicolon if any.
 							for p+1 <= len(v) && v[p] == ' ' {
@@ -260,7 +278,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 							v = v[p:]
 						}
 						if len(v) > 0 {
-							f("cookie", v)
+							f("cookie", "cookie", v)
 						}
 					}
 					return
@@ -272,7 +290,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			}
 
 			for _, v := range vv {
-				f(k, v)
+				f(k, wireName, v)
 			}
 		}
 
@@ -281,12 +299,12 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			for _, ph := range orderPlan {
 				if ph.contentLength {
 					if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
-						f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
+						f("content-length", "content-length", strconv.FormatInt(req.ActualContentLength, 10))
 						didContentLength = true
 					}
 					continue
 				}
-				processHeader(ph.key, ph.values)
+				processHeader(ph.key, ph.wireName, ph.values)
 			}
 		} else {
 			// No order specified, use sorted order for consistency
@@ -296,18 +314,18 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				processHeader(k, req.Header[k])
+				processHeader(k, "", req.Header[k])
 			}
 		}
 		// Only send content-length here if not already sent via HeaderOrder
 		if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
-			f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
+			f("content-length", "content-length", strconv.FormatInt(req.ActualContentLength, 10))
 		}
 		if param.AddGzipHeader {
-			f("accept-encoding", "gzip")
+			f("accept-encoding", "accept-encoding", "gzip")
 		}
 		if !didUA {
-			f("user-agent", param.DefaultUserAgent)
+			f("user-agent", "user-agent", param.DefaultUserAgent)
 		}
 	}
 
@@ -317,7 +335,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 	// modifying the hpack state.
 	if param.PeerMaxHeaderListSize > 0 {
 		hlSize := uint64(0)
-		enumerateHeaders(func(name, value string) {
+		enumerateHeaders(func(name, _, value string) {
 			hf := hpack.HeaderField{Name: name, Value: value}
 			hlSize += uint64(hf.Size())
 		})
@@ -330,18 +348,24 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 	trace := httptrace.ContextClientTrace(ctx)
 
 	// Header list size is ok. Write the headers.
-	enumerateHeaders(func(name, value string) {
-		name, ascii := LowerHeader(name)
-		if !ascii {
-			// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
-			// field names have to be ASCII characters (just as in HTTP/1.x).
-			return
+	enumerateHeaders(func(name, wireName, value string) {
+		if wireName == "" {
+			var ascii bool
+			wireName, ascii = LowerHeader(name)
+			if !ascii {
+				// Skip writing invalid headers. Per RFC 7540, Section 8.1.2, header
+				// field names have to be ASCII characters (just as in HTTP/1.x).
+				// A name arriving with wireName set never trips this: it came off
+				// the order plan, and validateHeaders vetted every planned name
+				// above before the plan was built.
+				return
+			}
 		}
 
-		headerf(name, value)
+		headerf(wireName, value)
 
 		if trace != nil && trace.WroteHeaderField != nil {
-			trace.WroteHeaderField(name, []string{value})
+			trace.WroteHeaderField(wireName, []string{value})
 		}
 	})
 
@@ -584,18 +608,30 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 	}
 }
 
+// Default pseudo-header emission orders. Chrome sends
+// :method, :authority, :scheme, :path; a non-extended CONNECT has no
+// :scheme or :path, and an extended CONNECT carries :protocol last.
+var (
+	defaultPseudoOrder         = []string{":method", ":authority", ":scheme", ":path"}
+	defaultPseudoOrderConnect  = []string{":method", ":authority"}
+	defaultPseudoOrderProtocol = []string{":method", ":authority", ":scheme", ":path", ":protocol"}
+)
+
 // foldKey returns the ASCII-lowered form of a header name, the canonical
 // representative of its fold class: foldKey(a) == foldKey(b) exactly when
 // asciiEqualFold(a, b), for any byte strings, because both touch only 'A'-'Z'.
-// A well-known canonical name resolves through the interned table and an
-// already-lowercase name is returned as is, so neither allocates.
+// An already-lowercase name is returned as is after nothing but the scan, and
+// a well-known canonical name resolves through the interned table, so neither
+// allocates. The table is only consulted once an uppercase byte proves the
+// scan cannot succeed; every interned key is canonical cased, so the scan
+// never skips past a name the table holds.
 func foldKey(s string) string {
-	buildCommonHeaderMapsOnce()
-	if l, ok := commonLowerHeader[s]; ok {
-		return l
-	}
 	for i := 0; i < len(s); i++ {
 		if 'A' <= s[i] && s[i] <= 'Z' {
+			buildCommonHeaderMapsOnce()
+			if l, ok := commonLowerHeader[s]; ok {
+				return l
+			}
 			b := []byte(s)
 			for ; i < len(b); i++ {
 				b[i] = lower(b[i])
@@ -609,9 +645,12 @@ func foldKey(s string) string {
 // plannedHeader is one emission the order plan produced: a resolved header
 // with the values its slot takes, or the slot at which content-length goes
 // out. Content-length is not in req.Header and its value is resolved at
-// emission time, so the plan only records its position.
+// emission time, so the plan only records its position. wireName is the
+// ASCII-lowered key, computed once while the fold index was built, so the
+// encode pass does not lower the same name again.
 type plannedHeader struct {
 	key           string
+	wireName      string
 	values        []string
 	contentLength bool
 }
@@ -625,9 +664,7 @@ type plannedHeader struct {
 // fold match over a randomised map iteration would point both order slots
 // at whichever one it happened to reach first. With more than one fold
 // candidate and no exact hit, take the lowest, so the wire order does not
-// change from request to request. The index below holds the lowest key per
-// fold class, built in one pass over h, so each entry resolves in one lookup
-// instead of a scan over the map.
+// change from request to request.
 //
 // A name may hold more than one slot in the order list, which is how a caller
 // asks for two fields of one name in chosen positions relative to other
@@ -636,52 +673,109 @@ type plannedHeader struct {
 // Headers h holds that the order list never named follow in map order; which
 // order that is varies per request but not between the two enumeration
 // passes, which replay one plan.
+//
+// The map keys live in a slice of entries and one index finds an entry by
+// exact key or by fold class, so a name resolves in one lookup and the slot
+// and cursor counts are plain ints on the entry rather than two more maps.
+// For the common caller, whose order names are already lowercase, the exact
+// key and the fold class share an index slot and even a fold resolution is a
+// single lookup.
 func planHeaderOrder(order []string, h map[string][]string) []plannedHeader {
-	index := make(map[string]string, len(h))
-	for hk := range h {
-		fk := foldKey(hk)
-		if best, ok := index[fk]; !ok || hk < best {
-			index[fk] = hk
-		}
+	// slots and cursor are int32 to keep the entry at 64 bytes; overflowing
+	// them would take an order list two billion entries long.
+	type headerEntry struct {
+		key    string
+		lower  string
+		values []string
+		slots  int32
+		cursor int32
 	}
-	resolve := func(k string) (string, bool) {
-		if _, ok := h[k]; ok {
-			return k, true
+	// Index values are entry index + 1, so absent and entry 0 stay distinct.
+	type indexEntry struct {
+		exact int32
+		fold  int32
+	}
+	entries := make([]headerEntry, 0, len(h))
+	index := make(map[string]indexEntry, 2*len(h))
+	for hk, vv := range h {
+		lk := foldKey(hk)
+		i := int32(len(entries) + 1)
+		entries = append(entries, headerEntry{key: hk, lower: lk, values: vv})
+		if hk == lk {
+			e := index[hk]
+			e.exact = i
+			if e.fold == 0 || hk < entries[e.fold-1].key {
+				e.fold = i
+			}
+			index[hk] = e
+		} else {
+			e := index[hk]
+			e.exact = i
+			index[hk] = e
+			fe := index[lk]
+			if fe.fold == 0 || hk < entries[fe.fold-1].key {
+				fe.fold = i
+				index[lk] = fe
+			}
 		}
-		hk, ok := index[foldKey(k)]
-		return hk, ok
 	}
 
-	slots := make(map[string]int, len(order))
-	for _, k := range order {
-		if hk, ok := resolve(k); ok {
-			slots[hk]++
-		}
-	}
-	// cursor doubles as the processed set: it gains a key exactly when an
-	// order slot resolved to it.
-	cursor := make(map[string]int, len(slots))
-
-	plan := make([]plannedHeader, 0, len(order))
-	for _, k := range order {
+	// Resolve every order name once. resolved holds the entry index + 1 per
+	// order slot, 0 for a name h does not hold and -1 for a content-length
+	// slot, which is not resolved against h at all.
+	resolved := make([]int32, len(order))
+	for oi, k := range order {
 		// Special case: content-length is not in req.Header but we handle it
 		if asciiEqualFold(k, "content-length") {
-			plan = append(plan, plannedHeader{contentLength: true})
+			resolved[oi] = -1
 			continue
 		}
-		hk, ok := resolve(k)
-		if !ok {
+		e, ok := index[k]
+		if !ok || e.exact == 0 {
+			// No exact entry. A fold class differing from the name itself can
+			// only be reached through foldKey; a name that is its own fold
+			// class already looked its class up.
+			if fk := foldKey(k); fk != k {
+				e = index[fk]
+			}
+			if e.fold == 0 {
+				continue
+			}
+			resolved[oi] = e.fold
+			entries[e.fold-1].slots++
 			continue
 		}
-		i := cursor[hk]
-		cursor[hk]++
-		if vv := valuesForSlot(h[hk], slots[hk], i); len(vv) > 0 {
-			plan = append(plan, plannedHeader{key: hk, values: vv})
+		resolved[oi] = e.exact
+		entries[e.exact-1].slots++
+	}
+
+	// An entry no order slot resolved to trails the plan in entry order,
+	// which is map iteration order, as before.
+	trailing := 0
+	for i := range entries {
+		if entries[i].slots == 0 {
+			trailing++
 		}
 	}
-	for k, vv := range h {
-		if _, ok := cursor[k]; !ok {
-			plan = append(plan, plannedHeader{key: k, values: vv})
+
+	plan := make([]plannedHeader, 0, len(order)+trailing)
+	for _, r := range resolved {
+		switch r {
+		case -1:
+			plan = append(plan, plannedHeader{contentLength: true})
+		case 0:
+		default:
+			e := &entries[r-1]
+			i := e.cursor
+			e.cursor++
+			if vv := valuesForSlot(e.values, int(e.slots), int(i)); len(vv) > 0 {
+				plan = append(plan, plannedHeader{key: e.key, wireName: e.lower, values: vv})
+			}
+		}
+	}
+	for i := range entries {
+		if e := &entries[i]; e.slots == 0 {
+			plan = append(plan, plannedHeader{key: e.key, wireName: e.lower, values: e.values})
 		}
 	}
 	return plan
