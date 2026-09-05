@@ -105,7 +105,6 @@ func NewDecoder(maxDynamicTableSize uint32, emitFunc func(f HeaderField)) *Decod
 		emitEnabled: true,
 		firstField:  true,
 	}
-	d.dynTab.table.init()
 	d.dynTab.allowedMaxSize = maxDynamicTableSize
 	d.dynTab.setMaxSize(maxDynamicTableSize)
 	return d
@@ -180,7 +179,7 @@ func (dt *dynamicTable) add(f HeaderField) {
 func (dt *dynamicTable) evict() {
 	var n int
 	for dt.size > dt.maxSize && n < dt.table.len() {
-		dt.size -= dt.table.ents[n].Size()
+		dt.size -= dt.table.entry(n).Size()
 		n++
 	}
 	dt.table.evictOldest(n)
@@ -199,16 +198,16 @@ func (d *Decoder) at(i uint64) (hf HeaderField, ok bool) {
 		return
 	}
 	if i <= uint64(staticTable.len()) {
-		return staticTable.ents[i-1], true
+		return staticTable.entry(int(i) - 1), true
 	}
 	if i > uint64(d.maxTableIndex()) {
 		return
 	}
 	// In the dynamic table, newer entries have lower indices.
-	// However, dt.ents[0] is the oldest entry. Hence, dt.ents is
+	// However, entry 0 is the oldest entry. Hence, the table is
 	// the reversed dynamic table.
-	dt := d.dynTab.table
-	return dt.ents[dt.len()-(int(i)-staticTable.len())], true
+	dt := &d.dynTab.table
+	return dt.entry(dt.len() - (int(i) - staticTable.len())), true
 }
 
 // DecodeFull decodes an entire block.
