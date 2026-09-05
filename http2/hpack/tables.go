@@ -13,11 +13,19 @@ import (
 type headerFieldTable struct {
 	// For static tables, entries are never evicted.
 	//
-	// For dynamic tables, entries are evicted from ents[0] and added to the end.
+	// For dynamic tables, entries are evicted from the front and added to the
+	// end. Rather than shifting the whole slice on every eviction, evicted
+	// entries leave a dead prefix behind: ents[:first] is evicted, ents[first:]
+	// is live. The prefix is compacted away once it outweighs the live entries,
+	// which costs O(1) per eviction amortized instead of a copy of the whole
+	// table each time.
+	//
+	// Entry k counts from the oldest live entry: entry k is ents[first+k].
+	//
 	// Each entry has a unique id that starts at one and increments for each
 	// entry that is added. This unique id is stable across evictions, meaning
 	// it can be used as a pointer to a specific entry. As in hpack, unique ids
-	// are 1-based. The unique id for ents[k] is k + evictCount + 1.
+	// are 1-based. The unique id for entry k is k + evictCount + 1.
 	//
 	// Zero is not a valid unique id.
 	//
@@ -27,10 +35,16 @@ type headerFieldTable struct {
 	// request adds (then evicts) 100 entries from the table, it would still take
 	// 2M years for evictCount to overflow.
 	ents       []HeaderField
+	first      int
 	evictCount uint64
 
 	// byName maps a HeaderField name to the unique id of the newest entry with
 	// the same name. See above for a definition of "unique id".
+	//
+	// byName and byNameValue are only read by search, which only encoders
+	// call. They are built on the first search and maintained incrementally
+	// from then on; a table that is never searched (a decoder's, in practice)
+	// never pays for them. Both maps are nil until then, always together.
 	byName map[string]uint64
 
 	// byNameValue maps a HeaderField name/value pair to the unique id of the newest
@@ -42,21 +56,23 @@ type pairNameValue struct {
 	name, value string
 }
 
-func (t *headerFieldTable) init() {
-	t.byName = make(map[string]uint64)
-	t.byNameValue = make(map[pairNameValue]uint64)
-}
-
 // len reports the number of entries in the table.
 func (t *headerFieldTable) len() int {
-	return len(t.ents)
+	return len(t.ents) - t.first
+}
+
+// entry returns entry k, where entry 0 is the oldest live entry.
+func (t *headerFieldTable) entry(k int) HeaderField {
+	return t.ents[t.first+k]
 }
 
 // addEntry adds a new entry.
 func (t *headerFieldTable) addEntry(f HeaderField) {
-	id := uint64(t.len()) + t.evictCount + 1
-	t.byName[f.Name] = id
-	t.byNameValue[pairNameValue{f.Name, f.Value}] = id
+	if t.byName != nil {
+		id := uint64(t.len()) + t.evictCount + 1
+		t.byName[f.Name] = id
+		t.byNameValue[pairNameValue{f.Name, f.Value}] = id
+	}
 	t.ents = append(t.ents, f)
 }
 
@@ -65,25 +81,42 @@ func (t *headerFieldTable) evictOldest(n int) {
 	if n > t.len() {
 		panic(fmt.Sprintf("evictOldest(%v) on table with %v entries", n, t.len()))
 	}
-	for k := 0; k < n; k++ {
-		f := t.ents[k]
-		id := t.evictCount + uint64(k) + 1
-		if t.byName[f.Name] == id {
-			delete(t.byName, f.Name)
-		}
-		if p := (pairNameValue{f.Name, f.Value}); t.byNameValue[p] == id {
-			delete(t.byNameValue, p)
+	if t.byName != nil {
+		for k := range n {
+			f := t.entry(k)
+			id := t.evictCount + uint64(k) + 1
+			if t.byName[f.Name] == id {
+				delete(t.byName, f.Name)
+			}
+			if p := (pairNameValue{f.Name, f.Value}); t.byNameValue[p] == id {
+				delete(t.byNameValue, p)
+			}
 		}
 	}
-	copy(t.ents, t.ents[n:])
-	for k := t.len() - n; k < t.len(); k++ {
-		t.ents[k] = HeaderField{} // so strings can be garbage collected
-	}
-	t.ents = t.ents[:t.len()-n]
+	clear(t.ents[t.first : t.first+n]) // so strings can be garbage collected
+	t.first += n
 	if t.evictCount+uint64(n) < t.evictCount {
 		panic("evictCount overflow")
 	}
 	t.evictCount += uint64(n)
+	if t.first > 0 && t.first >= t.len() {
+		live := copy(t.ents, t.ents[t.first:])
+		clear(t.ents[live:])
+		t.ents = t.ents[:live]
+		t.first = 0
+	}
+}
+
+// buildSearchMaps fills byName and byNameValue from the live entries.
+func (t *headerFieldTable) buildSearchMaps() {
+	t.byName = make(map[string]uint64, t.len())
+	t.byNameValue = make(map[pairNameValue]uint64, t.len())
+	for k := range t.len() {
+		f := t.entry(k)
+		id := t.evictCount + uint64(k) + 1
+		t.byName[f.Name] = id
+		t.byNameValue[pairNameValue{f.Name, f.Value}] = id
+	}
 }
 
 // search finds f in the table. If there is no match, i is 0.
@@ -92,14 +125,17 @@ func (t *headerFieldTable) evictOldest(n int) {
 // nameValueMatch becomes false.
 //
 // The returned index is a 1-based HPACK index. For dynamic tables, HPACK says
-// that index 1 should be the newest entry, but t.ents[0] is the oldest entry,
-// meaning t.ents is reversed for dynamic tables. Hence, when t is a dynamic
-// table, the return value i actually refers to the entry t.ents[t.len()-i].
+// that index 1 should be the newest entry, but entry 0 is the oldest entry,
+// meaning the entries are reversed for dynamic tables. Hence, when t is a
+// dynamic table, the return value i actually refers to entry t.len()-i.
 //
 // All tables are assumed to be a dynamic tables except for the global staticTable.
 //
 // See Section 2.3.3.
 func (t *headerFieldTable) search(f HeaderField) (i uint64, nameValueMatch bool) {
+	if t.byName == nil {
+		t.buildSearchMaps()
+	}
 	if !f.Sensitive {
 		if id := t.byNameValue[pairNameValue{f.Name, f.Value}]; id != 0 {
 			return t.idToIndex(id), true
@@ -117,7 +153,7 @@ func (t *headerFieldTable) idToIndex(id uint64) uint64 {
 	if id <= t.evictCount {
 		panic(fmt.Sprintf("id (%v) <= evictCount (%v)", id, t.evictCount))
 	}
-	k := id - t.evictCount - 1 // convert id to an index t.ents[k]
+	k := id - t.evictCount - 1 // convert id to an entry index, 0 = oldest
 	if t != staticTable {
 		return uint64(t.len()) - k // dynamic table
 	}

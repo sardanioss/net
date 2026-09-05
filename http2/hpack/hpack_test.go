@@ -119,9 +119,9 @@ func TestDecoderDecode(t *testing.T) {
 }
 
 func (dt *dynamicTable) reverseCopy() (hf []HeaderField) {
-	hf = make([]HeaderField, len(dt.table.ents))
+	hf = make([]HeaderField, dt.table.len())
 	for i := range hf {
-		hf[i] = dt.table.ents[len(dt.table.ents)-1-i]
+		hf[i] = dt.table.entry(dt.table.len() - 1 - i)
 	}
 	return
 }
