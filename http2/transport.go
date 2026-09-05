@@ -632,6 +632,12 @@ type ClientConn struct {
 	hbuf bytes.Buffer // HPACK encoder writes into this
 	henc *hpack.Encoder
 
+	// headerPlanCache caches header-order resolution across this
+	// connection's requests. Created on the first request that carries an
+	// order list and, like the encoder state above, only touched under wmu:
+	// encodeAndWriteHeaders is its sole user and holds wmu throughout.
+	headerPlanCache *httpcommon.HeaderPlanCache
+
 	// prefacePingID is the next preface ping payload, big-endian, starting at
 	// 1. Chromium's next_ping_id_.
 	prefacePingID uint64
@@ -2011,7 +2017,13 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
 	cc.hbuf.Reset()
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, func(name, value string) {
+	// A connection that sends ordered headers caches the order resolution
+	// across its requests. The cache is only correct single-threaded, which
+	// wmu (held above) guarantees here.
+	if cc.headerPlanCache == nil && (len(cc.t.HeaderOrder) > 0 || len(req.Header[HeaderOrderKey]) > 0) {
+		cc.headerPlanCache = httpcommon.NewHeaderPlanCache()
+	}
+	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, cc.headerPlanCache, func(name, value string) {
 		cc.writeHeader(name, value)
 	})
 	if err != nil {
@@ -2055,7 +2067,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	return err
 }
 
-func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, planCache *httpcommon.HeaderPlanCache, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
 	// Check for per-request magic keys (compatible with bogdanfinn/fhttp)
 	// These override transport-level settings
 	effectivePseudoOrder := pseudoHeaderOrder
@@ -2089,6 +2101,7 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 		PseudoHeaderOrder:     effectivePseudoOrder,
 		HeaderOrder:           effectiveHeaderOrder,
 		DisableCookieSplit:    disableCookieSplit,
+		PlanCache:             planCache,
 	}, headerf)
 }
 

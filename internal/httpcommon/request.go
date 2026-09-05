@@ -63,6 +63,16 @@ type EncodeHeadersParam struct {
 	// HPACK entry instead of splitting on semicolons per RFC 9113 §8.2.3.
 	// Chrome sends cookies as one entry; splitting is detectable by servers.
 	DisableCookieSplit bool
+
+	// PlanCache, when non-nil, caches header-order resolution metadata
+	// across calls, for callers that send the same header shape on many
+	// requests. It never changes what is sent: a cached resolution is fully
+	// verified against the request before use and any divergence falls back
+	// to the ordinary build. The cache is not safe for concurrent use, so a
+	// caller must not share one between two EncodeHeaders calls that can
+	// overlap; the http2 transport keeps one per connection and encodes
+	// under the connection's write lock.
+	PlanCache *HeaderPlanCache
 }
 
 // EncodeHeadersResult is the result of EncodeHeaders.
@@ -151,7 +161,11 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 	// replay the resolved plan.
 	var orderPlan []plannedHeader
 	if len(param.HeaderOrder) > 0 {
-		orderPlan = planHeaderOrder(param.HeaderOrder, req.Header)
+		if param.PlanCache != nil {
+			orderPlan = param.PlanCache.plan(param.HeaderOrder, req.Header)
+		} else {
+			orderPlan = planHeaderOrder(param.HeaderOrder, req.Header)
+		}
 	}
 
 	// 8.1.2.3 Request Pseudo-Header Fields
@@ -681,22 +695,48 @@ type plannedHeader struct {
 // key and the fold class share an index slot and even a fold resolution is a
 // single lookup.
 func planHeaderOrder(order []string, h map[string][]string) []plannedHeader {
-	// slots and cursor are int32 to keep the entry at 64 bytes; overflowing
-	// them would take an order list two billion entries long.
-	type headerEntry struct {
-		key    string
-		lower  string
-		values []string
-		slots  int32
-		cursor int32
+	return planHeaderOrderInto(order, h, nil)
+}
+
+// headerEntry is one header map entry under resolution: its exact key, the
+// ASCII-lowered form, the values, and the slot bookkeeping. slots and cursor
+// are int32 to keep the entry at 64 bytes; overflowing them would take an
+// order list two billion entries long.
+type headerEntry struct {
+	key    string
+	lower  string
+	values []string
+	slots  int32
+	cursor int32
+}
+
+// indexEntry finds a headerEntry by exact key or by fold class. Values are
+// the entry index + 1, so absent and entry 0 stay distinct.
+type indexEntry struct {
+	exact int32
+	fold  int32
+}
+
+// planHeaderOrderInto is planHeaderOrder with its working storage taken from
+// scratch when scratch is non-nil, so a caching caller reuses one allocation
+// set across requests. In that case the returned plan aliases scratch.plan
+// and is valid until the next call with the same scratch, and the entry and
+// resolution slices are left behind for the caller to read.
+func planHeaderOrderInto(order []string, h map[string][]string, scratch *planScratch) []plannedHeader {
+	var entries []headerEntry
+	var index map[string]indexEntry
+	if scratch == nil {
+		entries = make([]headerEntry, 0, len(h))
+		index = make(map[string]indexEntry, 2*len(h))
+	} else {
+		entries = scratch.entries[:0]
+		if scratch.index == nil {
+			scratch.index = make(map[string]indexEntry, 2*len(h))
+		} else {
+			clear(scratch.index)
+		}
+		index = scratch.index
 	}
-	// Index values are entry index + 1, so absent and entry 0 stay distinct.
-	type indexEntry struct {
-		exact int32
-		fold  int32
-	}
-	entries := make([]headerEntry, 0, len(h))
-	index := make(map[string]indexEntry, 2*len(h))
 	for hk, vv := range h {
 		lk := foldKey(hk)
 		i := int32(len(entries) + 1)
@@ -723,7 +763,18 @@ func planHeaderOrder(order []string, h map[string][]string) []plannedHeader {
 	// Resolve every order name once. resolved holds the entry index + 1 per
 	// order slot, 0 for a name h does not hold and -1 for a content-length
 	// slot, which is not resolved against h at all.
-	resolved := make([]int32, len(order))
+	var resolved []int32
+	if scratch == nil {
+		resolved = make([]int32, len(order))
+	} else {
+		if cap(scratch.resolved) < len(order) {
+			scratch.resolved = make([]int32, len(order))
+		} else {
+			scratch.resolved = scratch.resolved[:len(order)]
+			clear(scratch.resolved)
+		}
+		resolved = scratch.resolved
+	}
 	for oi, k := range order {
 		// Special case: content-length is not in req.Header but we handle it
 		if asciiEqualFold(k, "content-length") {
@@ -758,7 +809,12 @@ func planHeaderOrder(order []string, h map[string][]string) []plannedHeader {
 		}
 	}
 
-	plan := make([]plannedHeader, 0, len(order)+trailing)
+	var plan []plannedHeader
+	if scratch == nil {
+		plan = make([]plannedHeader, 0, len(order)+trailing)
+	} else {
+		plan = scratch.plan[:0]
+	}
 	for _, r := range resolved {
 		switch r {
 		case -1:
@@ -777,6 +833,10 @@ func planHeaderOrder(order []string, h map[string][]string) []plannedHeader {
 		if e := &entries[i]; e.slots == 0 {
 			plan = append(plan, plannedHeader{key: e.key, wireName: e.lower, values: e.values})
 		}
+	}
+	if scratch != nil {
+		scratch.entries = entries
+		scratch.plan = plan
 	}
 	return plan
 }
