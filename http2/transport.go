@@ -560,6 +560,8 @@ type ClientConn struct {
 	readerDone chan struct{} // closed on error
 	readerErr  error         // set before readerDone is closed
 
+	reqWorkers requestWorkers // reusable doRequest goroutines; workers exit when readerDone closes
+
 	idleTimeout time.Duration // or 0 for never
 	idleTimer   *time.Timer
 
@@ -1794,7 +1796,7 @@ func (cc *ClientConn) roundTrip(req *http.Request, streamf func(*clientStream)) 
 
 	cs.requestedGzip = httpcommon.IsRequestGzip(req.Method, req.Header, cc.t.disableCompression())
 
-	go cs.doRequest(req, streamf)
+	cc.reqWorkers.dispatch(cc.readerDone, initialMaxConcurrentStreams, func() { cs.doRequest(req, streamf) })
 
 	waitDone := func() error {
 		select {
