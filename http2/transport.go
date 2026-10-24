@@ -717,6 +717,7 @@ type clientStream struct {
 	bodyDone      atomic.Bool
 	lingerTimer   *time.Timer   // guarded by cc.mu; see lingerForEndStream
 	lingerc       chan struct{} // closed when the stream starts lingering
+	cleanedUp     bool          // guarded by cc.mu; set by cleanupWriteRequest, the only place that stops lingerTimer
 
 	// headersEndedStream is set when the response HEADERS frame carried
 	// END_STREAM. The read loop writes it before closing respHeaderRecv, so
@@ -764,12 +765,14 @@ func lingering(cs *clientStream) bool {
 
 // lingerForEndStream arms the fallback reset for a closed, fully read
 // response. When END_STREAM arrives first, the stream ends cleanly and
-// cleanupWriteRequest stops the timer.
+// cleanupWriteRequest stops the timer. Nothing else stops it, so it is armed
+// only while cleanup has yet to run; once cleanup has run, the stream is over
+// and there is nothing left to wait for.
 func (cs *clientStream) lingerForEndStream() {
 	cc := cs.cc
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	if cs.lingerTimer == nil {
+	if cs.lingerTimer == nil && !cs.cleanedUp {
 		cs.lingerTimer = time.AfterFunc(endStreamLinger, func() {
 			cs.abortStream(errClosedResponseBody)
 		})
@@ -2252,6 +2255,7 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 	if cs.lingerTimer != nil {
 		cs.lingerTimer.Stop()
 	}
+	cs.cleanedUp = true
 	closeOnIdle := cc.singleUse || cc.doNotReuse || cc.t.disableKeepAlives() || cc.goAway != nil
 	// Have we read any frames from the connection since sending this request?
 	readSinceStream := cc.readBeforeStreamID > cs.ID

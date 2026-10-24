@@ -1035,14 +1035,6 @@ func TestTransportConnectRequest(t *testing.T) {
 	}
 }
 
-type headerType int
-
-const (
-	noHeader headerType = iota // omitted
-	oneHeader
-	splitHeader // broken into continuation on purpose
-)
-
 const (
 	f0 = noHeader
 	f1 = oneHeader
