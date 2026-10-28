@@ -165,6 +165,26 @@ type Transport struct {
 	// server; an even one fails NewClientConn.
 	FirstStreamID uint32
 
+	// WindowRefresh, when non-nil, decides when the client hands receive
+	// credit back to the peer, at both scopes, in place of the default rule.
+	// The default is Chromium's (net/spdy/spdy_stream.cc,
+	// IncreaseRecvWindowSize): bytes count once the response body has been
+	// read, and go back once more than half the window is waiting or five
+	// seconds have passed since the last update. Firefox's rule is
+	// &WindowRefresh{OnArrival: true, AckAt: 4194304, Floor: 98304,
+	// ReadBuffer: 786432}.
+	//
+	// A rule also measures the connection's receive window from
+	// ConnectionFlow: 65535 plus the increment the preface sends, which is
+	// the window the peer was actually given. Without one the connection
+	// keeps the window this transport has always assumed, the default
+	// connection flow (or the net/http HTTP2Config's) plus 65535, whatever
+	// ConnectionFlow sends, so a transport that sets no rule sees no change.
+	//
+	// Values past 2^31-1, a negative Interval, and a ReadBuffer without
+	// OnArrival fail NewClientConn.
+	WindowRefresh *WindowRefresh
+
 	// Settings contains custom HTTP/2 SETTINGS values to send.
 	// Keys are SettingID values (e.g., SettingHeaderTableSize).
 	// If nil, default settings are used.
@@ -643,8 +663,9 @@ type ClientConn struct {
 	peerMaxHeaderTableSize      uint32
 	initialWindowSize           uint32
 	initialStreamRecvWindowSize int32
-	streamRecvWindow            int32  // initialStreamRecvWindowSize plus streamWindowUpdate
-	streamWindowUpdate          uint32 // Transport.StreamWindowUpdate when the connection was made
+	streamRecvWindow            int32          // initialStreamRecvWindowSize plus streamWindowUpdate
+	streamWindowUpdate          uint32         // Transport.StreamWindowUpdate when the connection was made
+	refresh                     *WindowRefresh // a copy of Transport.WindowRefresh, or nil
 	readIdleTimeout             time.Duration
 	pingTimeout                 time.Duration
 	extendedConnectAllowed      bool
@@ -1147,6 +1168,13 @@ func (t *Transport) NewClientConn(c net.Conn) (*ClientConn, error) {
 func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook func()) (*ClientConn, error) {
 	conf := configFromTransport(t)
 	firstStreamID, streamWindowUpdate, streamRecvWindow, err := t.streamStart(conf)
+	var (
+		refresh        *WindowRefresh
+		connRecvWindow int32
+	)
+	if err == nil {
+		refresh, connRecvWindow, err = t.windowRefresh(conf)
+	}
 	if err != nil {
 		if c != nil {
 			c.Close()
@@ -1164,6 +1192,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		initialStreamRecvWindowSize: conf.MaxUploadBufferPerStream,
 		streamRecvWindow:            streamRecvWindow,
 		streamWindowUpdate:          streamWindowUpdate,
+		refresh:                     refresh,
 		maxConcurrentStreams:        initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
 		strictMaxConcurrentStreams:  conf.StrictMaxConcurrentRequests,
 		peerMaxHeaderListSize:       0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
@@ -1271,7 +1300,8 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		cc.fr.WritePriority(priority.StreamID, priority.PriorityParam)
 	}
 
-	cc.inflow.init(conf.MaxUploadBufferPerConnection+initialWindowSize, time.Now())
+	cc.inflow.rule = refresh
+	cc.inflow.init(connRecvWindow, time.Now())
 	cc.bw.Flush()
 	if cc.werr != nil {
 		cc.Close()
@@ -1314,6 +1344,41 @@ func (t *Transport) streamStart(conf http2Config) (firstID, windowUpdate uint32,
 		return 0, 0, 0, fmt.Errorf("http2: StreamWindowUpdate %d takes the stream window past 2^31-1", windowUpdate)
 	}
 	return firstID, windowUpdate, int32(window), nil
+}
+
+// windowRefresh checks WindowRefresh and resolves the connection's receive
+// window, the bytes the peer may send it before the first refresh. The rule
+// comes back as a copy, so the connection never sees later changes to the
+// Transport's.
+func (t *Transport) windowRefresh(conf http2Config) (rule *WindowRefresh, connWindow int32, err error) {
+	connWindow = conf.MaxUploadBufferPerConnection + initialWindowSize
+	r := t.WindowRefresh
+	if r == nil {
+		return nil, connWindow, nil
+	}
+	for _, v := range []struct {
+		name string
+		n    uint32
+	}{{"AckAt", r.AckAt}, {"Floor", r.Floor}, {"ReadBuffer", r.ReadBuffer}} {
+		if v.n > math.MaxInt32 {
+			return nil, 0, fmt.Errorf("http2: WindowRefresh.%s %d is past 2^31-1", v.name, v.n)
+		}
+	}
+	if r.Interval < 0 {
+		return nil, 0, fmt.Errorf("http2: WindowRefresh.Interval %v is negative", r.Interval)
+	}
+	if r.ReadBuffer != 0 && !r.OnArrival {
+		return nil, 0, errors.New("http2: WindowRefresh.ReadBuffer applies only with OnArrival")
+	}
+	if t.ConnectionFlow != 0 {
+		w := int64(t.ConnectionFlow) + initialWindowSize
+		if w > math.MaxInt32 {
+			return nil, 0, fmt.Errorf("http2: ConnectionFlow %d takes the connection window past 2^31-1", t.ConnectionFlow)
+		}
+		connWindow = int32(w)
+	}
+	c := *r
+	return &c, connWindow, nil
 }
 
 // maxPendingResets is the absolute ceiling on the reset back-pressure counter.
@@ -2776,6 +2841,7 @@ type resAndError struct {
 func (cc *ClientConn) addStreamLocked(cs *clientStream) {
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
+	cs.inflow.rule = cc.refresh
 	cs.inflow.init(cc.streamRecvWindow, time.Now())
 	cs.ID = cc.nextStreamID
 	cc.nextStreamID += 2
@@ -3329,12 +3395,25 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 		return
 	}
 
+	// Under an arrival rule these bytes were counted when they arrived. All a
+	// read can change is a stream's held-back share: draining bytes that sat
+	// beyond the read buffer may leave the stream owing the peer an update, as
+	// Firefox's ProcessSlowConsumer runs UpdateLocalRwin again with nothing
+	// new. Writes only grow the pipe, so if this read started at or below the
+	// buffer, it drained nothing that was held back.
+	arrival := cc.refresh != nil && cc.refresh.OnArrival
+	if arrival && (err != nil || cs.bufPipe.Len()+n <= int(cc.refresh.ReadBuffer)) {
+		return
+	}
+
 	// Read the clock once per event, outside the lock.
 	now := time.Now()
 
 	cc.mu.Lock()
-	connAdd := cc.inflow.add(n, now)
-	var streamAdd int32
+	var connAdd, streamAdd int32
+	if !arrival {
+		connAdd = cc.inflow.add(n, now)
+	}
 	// No need to refresh if the stream is over or failed, and none at all once
 	// the peer has closed its half: Chromium's stream-scope update opens with
 	// an is-the-stream-still-active check and returns early, which is why a
@@ -3357,7 +3436,14 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 	default:
 	}
 	if err == nil && !peerDone {
-		streamAdd = cs.inflow.add(n, now)
+		if arrival {
+			// The pipe's length under cc.mu, which the read loop holds while it
+			// writes, so it matches what the stream has counted.
+			held := max(0, cs.bufPipe.Len()-int(cc.refresh.ReadBuffer))
+			streamAdd = cs.inflow.addHeld(0, held, now)
+		} else {
+			streamAdd = cs.inflow.add(n, now)
+		}
 	}
 	cc.mu.Unlock()
 
@@ -3398,8 +3484,10 @@ func (b transportResponseBody) Close() error {
 	cs.bufPipe.BreakWithError(errClosedResponseBody)
 	cs.abortStream(errClosedResponseBody)
 
+	// Under an arrival rule the connection counted these bytes when they
+	// arrived, so there is nothing left to return for them.
 	unread := cs.bufPipe.Len()
-	if unread > 0 {
+	if unread > 0 && (cc.refresh == nil || !cc.refresh.OnArrival) {
 		now := time.Now()
 		cc.mu.Lock()
 		// Return connection-level flow control.
@@ -3505,6 +3593,15 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 			refund += pad
 		}
 
+		// What the reader has left in the pipe before this frame joins it,
+		// which is all an arrival rule holds back: Firefox runs its check as
+		// the frame header is parsed, before the payload is parked.
+		arrival := cc.refresh != nil && cc.refresh.OnArrival
+		var unread int
+		if arrival {
+			unread = cs.bufPipe.Len()
+		}
+
 		didReset := false
 		var err error
 		if len(data) > 0 {
@@ -3517,19 +3614,35 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		}
 
 		refundNow := time.Now()
-		sendConn := cc.inflow.add(refund, refundNow)
-		var sendStream int32
-		if !didReset {
-			sendStream = cs.inflow.add(refund, refundNow)
+		var sendConn, sendStream int32
+		if arrival {
+			// The whole frame counts now. The stream skips the frame that ends
+			// it, as Firefox's UpdateLocalStreamWindow returns early on
+			// mInputFrameFinal: no update could be spent on it.
+			sendConn = cc.inflow.add(int(f.Length), refundNow)
+			if !didReset && !f.StreamEnded() {
+				held := max(0, unread-int(cc.refresh.ReadBuffer))
+				sendStream = cs.inflow.addHeld(int(f.Length), held, refundNow)
+			}
+		} else {
+			sendConn = cc.inflow.add(refund, refundNow)
+			if !didReset {
+				sendStream = cs.inflow.add(refund, refundNow)
+			}
 		}
 		cc.mu.Unlock()
 
 		if sendConn > 0 || sendStream > 0 {
 			cc.wmu.Lock()
+			// An arrival rule writes the stream's update first, as Firefox's
+			// UpdateLocalRwin queues it ahead of the session's.
+			if arrival && sendStream > 0 {
+				cc.fr.WriteWindowUpdate(cs.ID, uint32(sendStream))
+			}
 			if sendConn > 0 {
 				cc.fr.WriteWindowUpdate(0, uint32(sendConn))
 			}
-			if sendStream > 0 {
+			if !arrival && sendStream > 0 {
 				cc.fr.WriteWindowUpdate(cs.ID, uint32(sendStream))
 			}
 			cc.bw.Flush()
