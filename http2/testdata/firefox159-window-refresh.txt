@@ -1,0 +1,51 @@
+# Firefox 159.0's receive-window bookkeeping, excerpted for
+# TestWindowRefreshReplaysFirefox, which says where it comes from and what it
+# covers. Each line is one MOZ_LOG=nsHttp:4 line from
+# Http2Session::UpdateLocalStreamWindow (S) or UpdateLocalSessionWindow (C),
+# with the acksize of the Ack line that followed it, or 0 if none did:
+#
+#   S stream newbytes unacked localWindow acksize   (unacked is LocalUnAcked)
+#   C 0      newbytes 0       localWindow acksize
+#
+# localWindow is logged after the frame is counted and before any ack. A run
+# holds consecutive lines of one scope, a stream or the session, from one
+# capture. A blank line is a cut.
+
+# two, stream 5: a reader that keeps up. The stream reaches 4194304 waiting
+# and acks exactly that.
+S 5 16384 4177920 8404992 0
+S 5 16384 4194304 8388608 4194304
+S 5 16384 16384 12566528 0
+
+# two, the session, a moment later: it reaches 4194304 waiting and acks
+# exactly that.
+C 0 16384 0 8404992 0
+C 0 16384 0 8388608 4194304
+C 0 16384 0 12566528 0
+
+# read, stream 5: a reader that has fallen behind. Only what is not held
+# counts toward 4194304, so nothing goes back with 8159232 waiting, 4210688 of
+# them held. Then the stream acks the 4734976 not held. Then every waiting
+# byte is held, and nothing goes back.
+S 5 16384 3948544 4423680 0
+S 5 16384 4734976 4407296 4734976
+S 5 16384 0 9125888 0
+
+# read, stream 5: at a window of 98304 the stream acks what is not held,
+# 786432, though 11698176 more are waiting.
+S 5 16384 786432 114688 0
+S 5 16384 786432 98304 786432
+S 5 16384 0 868352 0
+
+# unread, stream 5: every waiting byte is held, so nothing goes back, even at
+# 98304 and at a window of 0. As the consumer then drains, checks with no new
+# bytes ack what it took, while the window is 98304 or less.
+S 5 16384 0 16384 0
+S 5 16384 0 0 0
+S 5 0 16384 0 16384
+S 5 0 32768 16384 32768
+
+# two, stream 5: a check with no new bytes reaches 4194304 and acks it, with
+# 131072 still held.
+S 5 0 4194304 8257536 4194304
+S 5 0 32768 12451840 0
