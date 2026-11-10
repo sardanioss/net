@@ -195,6 +195,13 @@ type Transport struct {
 	// Chrome sends cookies as one entry; splitting is detectable by servers.
 	DisableCookieSplit bool
 
+	// ZeroContentLengthMethods names the methods whose requests send
+	// "content-length: 0" when they carry no body. Nil means POST, PUT and
+	// PATCH, as net/http does; a non-nil list replaces them, so an empty one
+	// sends the header for no method. Chrome and Firefox send it on a POST
+	// and a PUT only, Safari on every method but GET and HEAD.
+	ZeroContentLengthMethods []string
+
 	// WireCaseResponseHeaders, when true, keys a response's Header map by the
 	// field name exactly as the wire carried it instead of canonicalising it.
 	// HTTP/2 requires lowercase field names (RFC 9113 §8.2.1) and the framer
@@ -2131,7 +2138,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	if cc.headerPlanCache == nil && (len(cc.t.HeaderOrder) > 0 || len(req.Header[HeaderOrderKey]) > 0) {
 		cc.headerPlanCache = httpcommon.NewHeaderPlanCache()
 	}
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, cc.headerPlanCache, func(name, value string) {
+	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, cc.t.ZeroContentLengthMethods, cc.headerPlanCache, func(name, value string) {
 		cc.writeHeader(name, value)
 	})
 	if err != nil {
@@ -2188,7 +2195,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	return err
 }
 
-func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, planCache *httpcommon.HeaderPlanCache, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, zeroContentLengthMethods []string, planCache *httpcommon.HeaderPlanCache, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
 	// Check for per-request magic keys (compatible with bogdanfinn/fhttp)
 	// These override transport-level settings
 	effectivePseudoOrder := pseudoHeaderOrder
@@ -2216,13 +2223,14 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 			Method:              req.Method,
 			ActualContentLength: actualContentLength(req),
 		},
-		AddGzipHeader:         addGzipHeader,
-		PeerMaxHeaderListSize: peerMaxHeaderListSize,
-		DefaultUserAgent:      effectiveUserAgent,
-		PseudoHeaderOrder:     effectivePseudoOrder,
-		HeaderOrder:           effectiveHeaderOrder,
-		DisableCookieSplit:    disableCookieSplit,
-		PlanCache:             planCache,
+		AddGzipHeader:            addGzipHeader,
+		PeerMaxHeaderListSize:    peerMaxHeaderListSize,
+		DefaultUserAgent:         effectiveUserAgent,
+		PseudoHeaderOrder:        effectivePseudoOrder,
+		HeaderOrder:              effectiveHeaderOrder,
+		DisableCookieSplit:       disableCookieSplit,
+		ZeroContentLengthMethods: zeroContentLengthMethods,
+		PlanCache:                planCache,
 	}, headerf)
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/sardanioss/http/httptrace"
 	"net/textproto"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,6 +64,14 @@ type EncodeHeadersParam struct {
 	// HPACK entry instead of splitting on semicolons per RFC 9113 §8.2.3.
 	// Chrome sends cookies as one entry; splitting is detectable by servers.
 	DisableCookieSplit bool
+
+	// ZeroContentLengthMethods names the methods whose requests send
+	// "content-length: 0" when they carry no body. Nil means POST, PUT and
+	// PATCH, as net/http does; a non-nil list replaces them, so an empty one
+	// sends the header for no method. Browsers disagree here: Chrome and
+	// Firefox send it on a POST and a PUT only, Safari on every method but
+	// GET and HEAD.
+	ZeroContentLengthMethods []string
 
 	// PlanCache, when non-nil, caches header-order resolution metadata
 	// across calls, for callers that send the same header shape on many
@@ -313,7 +322,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		if orderPlan != nil {
 			for _, ph := range orderPlan {
 				if ph.contentLength {
-					if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+					if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength, param.ZeroContentLengthMethods) {
 						f("content-length", "content-length", strconv.FormatInt(req.ActualContentLength, 10))
 						didContentLength = true
 					}
@@ -333,7 +342,7 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 			}
 		}
 		// Only send content-length here if not already sent via HeaderOrder
-		if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+		if !didContentLength && shouldSendReqContentLength(req.Method, req.ActualContentLength, param.ZeroContentLengthMethods) {
 			f("content-length", "content-length", strconv.FormatInt(req.ActualContentLength, 10))
 		}
 		if param.AddGzipHeader {
@@ -519,10 +528,11 @@ func validateHeaders(hdrs map[string][]string) string {
 
 // shouldSendReqContentLength reports whether we should send
 // a "content-length" request header. This logic is basically a copy of the net/http
-// transferWriter.shouldSendContentLength.
+// transferWriter.shouldSendContentLength, except that zeroMethods, when non-nil,
+// replaces the methods that declare an empty body.
 // The contentLength is the corrected contentLength (so 0 means actually 0, not unknown).
 // -1 means unknown.
-func shouldSendReqContentLength(method string, contentLength int64) bool {
+func shouldSendReqContentLength(method string, contentLength int64, zeroMethods []string) bool {
 	if contentLength > 0 {
 		return true
 	}
@@ -531,6 +541,9 @@ func shouldSendReqContentLength(method string, contentLength int64) bool {
 	}
 	// For zero bodies, whether we send a content-length depends on the method.
 	// It also kinda doesn't matter for http2 either way, with END_STREAM.
+	if zeroMethods != nil {
+		return slices.Contains(zeroMethods, method)
+	}
 	switch method {
 	case "POST", "PUT", "PATCH":
 		return true
