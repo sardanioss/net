@@ -408,6 +408,9 @@ func TestWindowRefreshRejectsWhatItCannotCarry(t *testing.T) {
 		{"ReadBuffer past 31 bits", &Transport{WindowRefresh: &WindowRefresh{OnArrival: true, ReadBuffer: 1 << 31}}},
 		{"negative Interval", &Transport{WindowRefresh: &WindowRefresh{Interval: -time.Second}}},
 		{"ReadBuffer without OnArrival", &Transport{WindowRefresh: &WindowRefresh{ReadBuffer: firefoxPipe}}},
+		{"AckAt above the window with nothing else to trigger", &Transport{
+			WindowRefresh: &WindowRefresh{AckAt: 8 << 20},
+		}},
 		{"connection window past 2^31-1", &Transport{
 			ConnectionFlow: math.MaxInt32 - 65534, WindowRefresh: firefoxRefresh(),
 		}},

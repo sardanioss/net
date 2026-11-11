@@ -6,7 +6,10 @@
 
 package http2
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // inflowSmallUpdateInterval is how long an update below the proportional
 // threshold is buffered before it goes out anyway.
@@ -65,6 +68,20 @@ type WindowRefresh struct {
 	// (nsHttpTransaction's NS_NewPipe2; network.buffer.cache.count and
 	// network.buffer.cache.size). Zero holds back every unread byte.
 	ReadBuffer uint32
+}
+
+// checkReachable refuses a rule that can never hand credit back. With no
+// Floor and no Interval, AckAt is the only trigger, and a window smaller than
+// AckAt runs dry before that many bytes can be waiting, so the transfer
+// stalls for good.
+func (r *WindowRefresh) checkReachable(streamWindow, connWindow int32) error {
+	if r.AckAt == 0 || r.Floor != 0 || r.Interval > 0 {
+		return nil
+	}
+	if w := min(streamWindow, connWindow); int64(r.AckAt) > int64(w) {
+		return fmt.Errorf("http2: WindowRefresh.AckAt %d is above the %d-byte receive window, and with no Floor or Interval credit would never go back", r.AckAt, w)
+	}
+	return nil
 }
 
 // due reports whether n waiting bytes go back to the peer now, given the

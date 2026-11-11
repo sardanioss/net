@@ -146,6 +146,7 @@ func TestStreamStartRejectsWhatTheWireCannotCarry(t *testing.T) {
 	}{
 		{"even first stream", &Transport{FirstStreamID: 2}},
 		{"first stream past 31 bits", &Transport{FirstStreamID: 1<<31 + 1}},
+		{"first stream with no room after it", &Transport{FirstStreamID: math.MaxInt32}},
 		{"window past 2^31-1", &Transport{
 			Settings:           map[SettingID]uint32{SettingInitialWindowSize: firefoxPushAllowance},
 			StreamWindowUpdate: math.MaxInt32,

@@ -1175,6 +1175,9 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	if err == nil {
 		refresh, connRecvWindow, err = t.windowRefresh(conf)
 	}
+	if err == nil && refresh != nil {
+		err = refresh.checkReachable(streamRecvWindow, connRecvWindow)
+	}
 	if err != nil {
 		if c != nil {
 			c.Close()
@@ -1334,8 +1337,11 @@ func (t *Transport) streamStart(conf http2Config) (firstID, windowUpdate uint32,
 	if firstID == 0 {
 		firstID = 1
 	}
-	if firstID%2 == 0 || firstID > math.MaxInt32 {
-		return 0, 0, 0, fmt.Errorf("http2: FirstStreamID %d is not an odd 31-bit stream ID", firstID)
+	// The last odd ID, 2^31-1, leaves no room for the stream after it, and
+	// a connection that cannot open one is never usable: the pool would dial
+	// it again and again.
+	if firstID%2 == 0 || firstID >= math.MaxInt32 {
+		return 0, 0, 0, fmt.Errorf("http2: FirstStreamID %d is not an odd 31-bit stream ID below 2^31-1", firstID)
 	}
 	// "A sender MUST NOT allow a flow-control window to exceed 2^31-1
 	// octets." RFC 9113 section 6.9.1.
