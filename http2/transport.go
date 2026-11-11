@@ -1500,6 +1500,22 @@ func (cc *ClientConn) State() ClientConnState {
 	}
 }
 
+// Closing reports whether cc can no longer open streams: it is closed, is
+// closing, has received or sent a GOAWAY, or is single-use or marked
+// DoNotReuse. It is State().Closed || State().Closing without the write
+// lock. State takes cc.wmu to read the peer's stream limit, and a stream
+// stuck writing to a peer that has stopped reading holds wmu for as long as
+// it is stuck, so a pool asking State on every lookup waits on that stream.
+// Closing takes only cc.mu.
+//
+// Unlike CanTakeNewRequest, a connection that is merely at its concurrent
+// stream limit is not closing.
+func (cc *ClientConn) Closing() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.closed || cc.closing || cc.singleUse || cc.doNotReuse || cc.goAway != nil
+}
+
 // clientConnIdleState describes the suitability of a client
 // connection to initiate a new RoundTrip request.
 type clientConnIdleState struct {
